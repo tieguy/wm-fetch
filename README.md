@@ -1,72 +1,191 @@
 # wm-fetch
 
-`wm-fetch` — fetch a URL from the shell with a Wikimedia-compliant
-User-Agent. This is the tool `~/Projects/CLAUDE.md` instructs every
-project session to use *instead of* harness fetch tools (which cannot set
-a User-Agent — a policy violation on every call).
+`wm-fetch` fetches a URL from the shell **with Wikimedia's rules for
+automated fetching enforced by construction**. It exists so that LLM agents
+(and humans) can fetch from Wikipedia and its sister projects without
+accidentally violating policy: every request identifies its operator,
+respects the API etiquette rules, paces itself, and honors robots.txt.
 
-**Canonical home:** this repo (`~/Projects/wiki/wm-fetch`). The installed
-`~/.local/bin/wm-fetch` is a symlink here — never let a divergent copy
-live elsewhere again; that is how v1.0 got lost.
+LLM harness fetch tools generally cannot set a User-Agent header — which
+makes **every call they make to a Wikimedia site a policy violation**
+waiting to be blocked. `wm-fetch` is the tool your agent should call
+instead.
 
-## What it does
+One URL per invocation. Stdout gets the body; diagnostics go to stderr.
 
-- **Compliant UA** (`wm-fetch/1.1 (User page + email) curl/x.y`) per the
-  [WMF User-Agent policy]; the contact identifies the operator, and any
-  fork edits `CONTACT_EMAIL`/`CONTACT_PAGE` — the fork-edit rule from
-  wikiactive applies here too.
-- **maxlag=5** appended to Action API URLs (`*api.php*`) when absent —
-  [API:Etiquette].
-- **gzip** (`--compressed`), **bounded redirects** (`-L --max-redirs 3`),
-  **bounded time** (`--connect-timeout 10 --max-time 60`) — a wedged
-  socket fails instead of hanging a session.
-- **429/503 backoff**: honors a numeric `Retry-After`, else exponential
-  (2, 4, 8, 16s), up to 4 attempts, then a loud exit 1.
-- Serial by construction: one URL per invocation; no parallel bursts.
-- Errors: body still printed on HTTP ≥ 4 (so callers can see the API's
-  error JSON), exit code 1 on transport failure or HTTP ≥ 400, 2 on usage.
+```sh
+wm-fetch "https://en.wikipedia.org/w/api.php?action=query&meta=siteinfo&format=json&formatversion=2"
+```
+
+## What it enforces
+
+| Rule | What wm-fetch does | Source |
+|---|---|---|
+| Identify yourself | Every request carries `wm-fetch-bot/<ver> (<your contact>) reqwest/<ver>` — client name, version, contact info, HTTP library. Refuses to run at all (exit 2) if no contact is configured. The default client name contains "bot" so WMF can classify the traffic. | [User-Agent policy](https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_User-Agent_Policy) |
+| Action API: use maxlag | `maxlag=5` (configurable) is appended to api.php URLs that lack one; **the HTTP-200 maxlag error form** (a JSON `error.code == "maxlag"` body with `Retry-After`/`X-Database-Lag` headers) is detected, waited out ≥5s, and retried. | [Manual:Maxlag parameter](https://www.mediawiki.org/wiki/Manual:Maxlag_parameter), [API:Etiquette](https://www.mediawiki.org/wiki/API:Etiquette) |
+| Always gzip | `Accept-Encoding: gzip` on every request. | [Robot policy](https://wikitech.wikimedia.org/wiki/Robot_policy) |
+| Respect 429 | 429/503 responses back off per `Retry-After` (numeric or HTTP-date), else exponential (2, 4, 8, 16s), then give up loudly with the last body on stdout. | [Robot policy](https://wikitech.wikimedia.org/wiki/Robot_policy) |
+| Serial requests / concurrency limits | One URL per invocation, and a file lock serializes simultaneous wm-fetch processes on the same machine (concurrency 1 across your agent sessions). | [Robot policy](https://wikitech.wikimedia.org/wiki/Robot_policy), [API:Etiquette](https://www.mediawiki.org/wiki/API:Etiquette) |
+| Rate limits (per-surface) | Pacing floors between requests — every request, including robots.txt fetches and redirect hops. The Robot policy's actual per-surface numbers are: websites <10 concurrent / <20 req/s; REST API unauthenticated 3 / <5 req/s; Action API unauthenticated 1 / <5 req/s plus a 5s pause after any request that took >1s to serve; Media API ≤2 concurrent / 25 Mbps. **wm-fetch applies the strictest applicable subset globally**: ≥250ms between request ends (≤4 req/s — strictly below 5), a ≥5s pause after any >1s request, and for "other wikimedia.org services" (gerrit/gitlab/phabricator/lists) a ≥1s floor plus a **15-minute refusal after any 5xx** from that host. | [Robot policy](https://wikitech.wikimedia.org/wiki/Robot_policy) |
+| Honor robots.txt | Web paths are checked against the host's robots.txt, with a per-host cache; refusals exit 3. Crawl-delay, when declared, raises the pacing floor. Fail-closed per RFC 9309 when robots.txt can't be fetched (see below). | [Robot policy](https://wikitech.wikimedia.org/wiki/Robot_policy) |
+| Media API 25 Mbps cap | **Not enforced — guidance.** A one-URL-at-a-time tool doesn't approach it; heavy media work should use the dumps anyway. | [Robot policy](https://wikitech.wikimedia.org/wiki/Robot_policy) |
+| Website content guidance (canonical `/wiki/` URLs, no query params, prefer thumbnails, dumps-first) | **Not enforced — guidance.** The tool is a fetcher, not a crawler; for bulk content use [dumps](https://dumps.wikimedia.org). | [Robot policy](https://wikitech.wikimedia.org/wiki/Robot_policy), [Wikipedia:Bot policy](https://en.wikipedia.org/wiki/Wikipedia:Bot_policy) |
+
+The umbrella document is the [Wikimedia Foundation Terms of Use](https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use),
+whose §12 ("API Terms") incorporates the User-Agent Policy, the Robot
+Policy, and API:Etiquette into the Terms by reference for API use. Also
+relevant for bots that *edit*: [Wikipedia:Bot policy](https://en.wikipedia.org/wiki/Wikipedia:Bot_policy)
+and [Meta's Bot policy](https://meta.wikimedia.org/wiki/Bot_policy) — wm-fetch never writes.
+
+## robots.txt, and the API-endpoint question
+
+This is the one place where Wikimedia's documents are in visible tension,
+so the tool's stance is explicit rather than hidden.
+
+Wikimedia's robots.txt (identical `User-agent: *` block on the Wikipedias,
+meta, mediawiki.org) says:
+
+```
+User-agent: *
+Allow: /w/api.php?action=mobileview&
+Allow: /w/load.php?
+Allow: /api/rest_v1/?doc
+Allow: /w/rest.php/site/v1/sitemap
+Disallow: /w/
+Disallow: /api/
+Disallow: /trap/
+Disallow: /wiki/Special:
+…
+```
+
+Taken literally, that disallows **all** Action API (`/w/api.php`) and REST
+API (`/api/`) fetching. But the same organization's [Terms of Use §12](https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use)
+makes the UA Policy, Robot policy, and API:Etiquette the governing rules
+*for API use*; [API:Etiquette](https://www.mediawiki.org/wiki/API:Etiquette)
+actively regulates API clients; and the [Robot policy](https://wikitech.wikimedia.org/wiki/Robot_policy)
+has a whole section telling api.php clients how to behave (concurrency 1,
+<5 req/s unauthenticated). Meanwhile that same Robot policy also says
+"Honor Robots.txt. Honor every directive in our robots.txt file" under
+rules that "apply to any activity on our websites."
+
+**wm-fetch's stance (scoped enforcement):**
+
+- **Web paths** (`/wiki/Foo`, `/w/index.php`, everything else): robots.txt
+  is honored — disallowed paths (e.g. `/wiki/Special:*`, `/trap/`, the
+  per-wiki blocklists) are refused, exit 3. Redirects are checked per hop,
+  so a 301 from an allowed path to a disallowed one is refused too.
+- **API endpoints** (`…/api.php`, `/api/…`, `…/rest.php…`): governed by the
+  API framework WMF actually wrote for those surfaces — UA policy,
+  maxlag, etiquette concurrency, 429 handling — *not* by the
+  crawler-oriented `Disallow: /w/` lines. The robots.txt `Allow:` carve-outs
+  for api.php/load.php/rest.php endpoints support the reading that API
+  traffic is sanctioned despite `Disallow: /w/`.
+- **robots.txt fetch failures**: HTTP 4xx → allow-all (RFC 9309); network
+  error / 5xx / redirect tangles → use any cached copy, however stale, and
+  if there is none, **refuse** (exit 3, "robots.txt unreachable — refusing
+  per RFC 9309; retry shortly"). Fail-closed is the point.
+
+We found no authoritative WMF statement reconciling the tension either
+way; if one appears, this section (and the behavior) should be updated.
 
 ## Usage
 
 ```
-wm-fetch <url> [extra curl args...]
+wm-fetch [OPTIONS] <URL>
 ```
 
-Extra curl args come AFTER the built-ins, so callers can override them —
-notably `-A` for a project's own registered UA (wikiactive and friends
-hardcode theirs; they should pass theirs). Do not pass `-o`, `-D`, or
-`-w` (used internally).
+| Option | Default | Meaning |
+|---|---|---|
+| `--contact-email`, `--contact-page` | — | Contact info for the User-Agent (at least one required unless `--user-agent`) |
+| `--client-name` | `wm-fetch-bot` | Client name in the UA |
+| `--user-agent` | — | Replace the constructed UA entirely. A custom UA **must itself satisfy the UA policy** (contact info in parentheses) — that obligation is yours; wm-fetch warns if it sees no contact group |
+| `--max-time` | `60` | Whole-invocation budget in seconds — includes pacing waits and lock waits, not just HTTP |
+| `--connect-timeout` | `10` | Connect timeout, seconds |
+| `--max-redirs` | `3` | Redirect hops followed (each hop is robots-checked and paced) |
+| `--retries` | `4` | Retries for 429/503/maxlag (0 = single attempt) |
+| `--maxlag` | `5` | maxlag seconds injected into api.php URLs lacking one |
+| `--config` | `~/.config/wm-fetch/config.toml` | Config file path (also `WM_FETCH_CONFIG`) |
+| `--init` | — | Write a commented config template (if none exists) and exit |
+| `--print-config` | — | Print effective config and the UA it would send, and exit |
+
+**Exit codes:** `0` success (body on stdout — even for HTTP ≥ 400, so
+callers can read the API's error JSON); `1` transport failure / HTTP ≥ 400
+after retries / `--max-time` abort; `2` usage or configuration error
+(including: no contact configured); `3` policy refusal — robots.txt
+disallow, robots.txt unreachable after cache fallback, or the
+other-services 5xx cooldown.
+
+**What agents will see on stderr:** pacing notices ("pacing: waiting
+4.2s — last request took >1s"), backoff narration, and occasionally a
+15-minute refusal window for gerrit/phabricator-class hosts after a 5xx.
+These are features, not bugs.
+
+## Configuration
+
+Precedence: CLI flags > `WM_FETCH_*` environment variables > config file
+> defaults. Config file (TOML):
+
+```toml
+contact_email  = "you@example.org"
+contact_page   = "https://en.wikipedia.org/wiki/User:YourName"
+client_name    = "wm-fetch-bot"
+retries        = 4
+max_time       = 60
+connect_timeout = 10
+max_redirs     = 3
+maxlag         = 5
+```
+
+**Configuration changes identity or timing — never compliance.** The
+User-Agent construction, robots.txt enforcement, and pacing floors cannot
+be turned off. The fail-closed contact rule means the binary *refuses to
+fetch* (exit 2) rather than send an anonymous request: run `wm-fetch
+--init` once per machine to scaffold `~/.config/wm-fetch/config.toml`.
+
+### If you fork this
+
+Set **your own** contact info before your first fetch. The tool will
+refuse to run with the upstream author's contact stripped out and nothing
+in its place — shipping a fork that identifies fetches as someone else is
+the exact bug this rule exists to prevent.
 
 ## Install
 
-```
-./install.sh          # symlinks ~/.local/bin/wm-fetch -> this repo's copy
-```
+Release binaries are attached to [GitHub releases](https://github.com/tieguy/wm-fetch/releases)
+(Linux x86_64, statically linked). Or with a Rust toolchain:
 
-Symlink, not copy: the repo stays the single source of truth and
-upgrades take effect immediately on every machine that symlinks here.
-
-## Tests
-
-```
-tests/smoke.sh        # bash -n + live en.wikipedia round trips
+```sh
+cargo install --git https://github.com/tieguy/wm-fetch
 ```
 
-The live legs assert: parseable siteinfo JSON on a clean call; and that
-the request actually carried `maxlag` (an invalid `maxlag=abc` must come
-back as the API's own `maxlag` error — proving the parameter reaches the
-API).
+From a checkout, `./install.sh` builds the release binary and symlinks
+`~/.local/bin/wm-fetch` to it (idempotent; refuses to clobber a foreign
+file), then reminds you to run `wm-fetch --init` if you have no config yet.
 
-## Version history
+## For LLM agents
 
-- **1.1** (2026-09-29, this repo's first hardened pass): temp-file cleanup
-  via `trap` (interrupts no longer leak `mktemp` files), bounded requests
-  (`--connect-timeout`/`--max-time`), bounded redirect following
-  (`-L --max-redirs 3`), UA gains the operator's on-wiki contact page
-  alongside the email, quoted temp paths, documented caller overrides.
-- **1.0** (imported verbatim from the operator's other machine): UA
-  policy compliance, maxlag injection, gzip, Retry-After-aware backoff.
-  Never committed anywhere before this repo — that was the bug.
+If you are writing instructions for an agent that fetches from Wikimedia
+properties, a snippet like this does the job:
 
-[WMF User-Agent policy]: https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_User-Agent_Policy
-[API:Etiquette]: https://www.mediawiki.org/wiki/API:Etiquette
+> Never use built-in web-fetch tools against Wikimedia sites — they cannot
+> set a User-Agent, which violates WMF policy. Instead run:
+> `wm-fetch <url>` (already installed). Read its stderr; if it exits 3,
+> respect the refusal — do not retry the same URL, use the API or dumps
+> instead as the message suggests.
+
+## Development
+
+```sh
+cargo test                                   # unit + offline integration (wiremock)
+cargo test --release -- --ignored            # live tests vs real Wikimedia
+WM_FETCH_LIVE_CONTACT="you@example.org" cargo test --release -- --ignored
+cargo fmt && cargo clippy --all-targets -- -D warnings
+```
+
+Live tests require your contact in `WM_FETCH_LIVE_CONTACT`. CI runs the
+offline suites plus a README link-check on every push.
+
+## License
+
+[Blue Oak Model License 1.0.0](https://blueoakcouncil.org/license/1.0.0) —
+see [LICENSE](LICENSE).

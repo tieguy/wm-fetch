@@ -1,0 +1,27 @@
+[package]
+name = "wm-fetch"
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "BlueOak-1.0.0"
+description = "Policy-compliant fetch tool for Wikimedia properties — safe for LLM agents to call"
+repository = "https://github.com/tieguy/wm-fetch"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+fs4 = "0.13"
+httpdate = "1"
+reqwest = { version = "0.13", features = ["blocking", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+texting_robots = "0.2"
+toml = "0.8"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+wiremock = "0.6"
