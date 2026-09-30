@@ -183,6 +183,26 @@ properties, a snippet like this does the job:
 > respect the refusal — do not retry the same URL, use the API or dumps
 > instead as the message suggests.
 
+## Prior art: when to use what
+
+wm-fetch's niche is narrow: one-shot, agent-callable fetching where the
+tool — not the caller — carries the compliance burden. That niche exists
+because WMF now enforces the User-Agent policy
+([T409871](https://phabricator.wikimedia.org/T409871) documents an agent
+tool's generic `axios` UA being 403'd). For adjacent jobs, established
+tools are the better choice:
+
+| If you need… | Use | Notes |
+|---|---|---|
+| A Python framework for a bot that edits, uploads, or logs in | [Pywikibot](https://github.com/wikimedia/pywikibot) | Throttling and maxlag built in — its config defaults cite the Robot policy directly. wm-fetch is read-only and unauthenticated by design. |
+| A Python library for structured Action API work | [mwclient](https://github.com/mwclient/mwclient) | The right call for programmatic Python use. Two honest caveats as of 0.11.0: `maxlag` is sent only on `index.php` calls — api.php calls go without it unless you pass it — and UA identification is opt-in rather than required ([question filed upstream](https://github.com/mwclient/mwclient/issues/426)). |
+| A quick fetch by a human who knows the rules | `curl` + [`~/.curlrc`](https://curl.se/docs/manpage.html) | `user-agent = "…"` persists a UA and `--retry` honors `Retry-After` (since 7.66) — but it fails *open*: forget the config and you're anonymous. No robots.txt, maxlag, or pacing. |
+| Recursive downloading / mirroring | [wget](https://www.gnu.org/software/wget/manual/html_node/Robot-Exclusion.html) | Honors robots.txt — but only in recursive mode; a one-shot `wget -O-` is not robots-checked. |
+| An MCP fetch tool for an agent host | [MCP fetch server](https://github.com/modelcontextprotocol/servers/tree/main/src/fetch) | Robots.txt on by default and `--user-agent` configurable — but the default UA carries no operator contact (a WMF policy problem) and robots honoring can be disabled with a flag. Compliance is opt-in, not by construction. |
+
+If you know of a tool that already enforces all of this by construction,
+please open an issue — we would rather point you at it.
+
 ## Development
 
 ```sh

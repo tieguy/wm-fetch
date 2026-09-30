@@ -34,7 +34,7 @@ jobs:
         run: |
           set -euo pipefail
           # Placeholder example URLs (config template samples) are skipped.
-          grep -oE 'https://(foundation\.wikimedia\.org|www\.mediawiki\.org|wikitech\.wikimedia\.org|en\.wikipedia\.org|meta\.wikimedia\.org|blueoakcouncil\.org|dumps\.wikimedia\.org|github\.com/tieguy/wm-fetch)[^) "]*' README.md \
+          grep -oE 'https://(foundation\.wikimedia\.org|phabricator\.wikimedia\.org|www\.mediawiki\.org|wikitech\.wikimedia\.org|en\.wikipedia\.org|meta\.wikimedia\.org|blueoakcouncil\.org|dumps\.wikimedia\.org|curl\.se|www\.gnu\.org|github\.com/(tieguy|mwclient|wikimedia|modelcontextprotocol))[^) "]*' README.md \
             | grep -v 'User:YourName' | sort -u > /tmp/links.txt
           test -s /tmp/links.txt
           fail=0
