@@ -64,10 +64,12 @@ fn live_siteinfo() {
 fn live_maxlag_reaches_api() {
     // An INVALID maxlag must come back as the API's own badinteger error
     // NAMING the parameter — proving our maxlag reaches the API. (Our
-    // injector leaves an explicit maxlag=abc untouched.)
+    // injector leaves an explicit maxlag=abc untouched.) Note: api.php
+    // reports parameter errors as HTTP 200 with error JSON, so this is a
+    // success-path fetch whose body we inspect.
     let (code, body, stderr) =
         run("https://en.wikipedia.org/w/api.php?action=query&meta=siteinfo&format=json&maxlag=abc");
-    assert_eq!(code, 1, "stderr: {stderr}"); // HTTP-level error body, exit 1 by contract
+    assert_eq!(code, 0, "stderr: {stderr}");
     let v: serde_json::Value = serde_json::from_str(&body)
         .unwrap_or_else(|e| panic!("not JSON ({e}): {}", &body[..body.len().min(200)]));
     assert_eq!(
