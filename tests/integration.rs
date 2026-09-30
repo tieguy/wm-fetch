@@ -93,7 +93,10 @@ async fn ua_header_sent() {
         .and_then(|v| v.to_str().ok())
         .expect("user-agent header present");
     assert!(
-        ua.starts_with("wm-fetch-bot/2.0.0 (https://en.wikipedia.org/wiki/User:Tester tester@example.org) reqwest/"),
+        ua.starts_with(&format!(
+            "wm-fetch-bot/{} (https://en.wikipedia.org/wiki/User:Tester tester@example.org) reqwest/",
+            env!("CARGO_PKG_VERSION")
+        )),
         "UA was {ua:?}"
     );
     let ae = target
@@ -228,7 +231,7 @@ fn print_config_contactless() {
         stdout(&out)
     );
     assert!(
-        stdout(&out).contains("wm-fetch-bot/2.0.0 ("),
+        stdout(&out).contains(&format!("wm-fetch-bot/{} (", env!("CARGO_PKG_VERSION"))),
         "stdout: {}",
         stdout(&out)
     );

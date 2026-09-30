@@ -49,7 +49,10 @@ mod tests {
             Some("https://en.wikipedia.org/wiki/User:LuisVilla"),
             Some("luis@lu.is"),
         );
-        assert!(ua.starts_with("wm-fetch-bot/2.0.0 ("), "{ua}");
+        assert!(
+            ua.starts_with(&format!("wm-fetch-bot/{} (", env!("CARGO_PKG_VERSION"))),
+            "{ua}"
+        );
         assert!(
             ua.contains("https://en.wikipedia.org/wiki/User:LuisVilla luis@lu.is"),
             "{ua}"
@@ -64,14 +67,23 @@ mod tests {
     #[test]
     fn ua_email_only() {
         let ua = build("mybot", None, Some("a@b.c"));
-        assert!(ua.starts_with("mybot/2.0.0 (a@b.c) reqwest/"), "{ua}");
+        assert!(
+            ua.starts_with(&format!(
+                "mybot/{} (a@b.c) reqwest/",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{ua}"
+        );
     }
 
     #[test]
     fn ua_page_only() {
         let ua = build("mybot", Some("https://example.org/bot"), None);
         assert!(
-            ua.starts_with("mybot/2.0.0 (https://example.org/bot) reqwest/"),
+            ua.starts_with(&format!(
+                "mybot/{} (https://example.org/bot) reqwest/",
+                env!("CARGO_PKG_VERSION")
+            )),
             "{ua}"
         );
     }
