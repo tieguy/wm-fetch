@@ -129,6 +129,13 @@ fn run(cli: &Cli) -> i32 {
 
     let cfg = match config::load(&overrides_from(cli)) {
         Ok(c) => c,
+        // --init and --print-config always run (they issue no requests):
+        // a broken config file must not lock the operator out of the
+        // recovery commands. Continue with defaults and say so.
+        Err(e) if cli.init || cli.print_config => {
+            warn(&format!("{e:#} (continuing with defaults)"));
+            config::Config::default()
+        }
         Err(e) => {
             warn(&format!("{e:#}"));
             return EXIT_USAGE;
@@ -232,8 +239,10 @@ fn run(cli: &Cli) -> i32 {
     match session.fetch(&parsed) {
         Ok(final_resp) => {
             let mut out = std::io::stdout();
-            let _ = out.write_all(&final_resp.body);
-            let _ = out.flush();
+            if let Err(e) = out.write_all(&final_resp.body).and_then(|()| out.flush()) {
+                warn(&format!("writing body to stdout: {e}"));
+                return EXIT_FAIL;
+            }
             if final_resp.failure || final_resp.status >= 400 {
                 if final_resp.status < 400 {
                     warn(&format!("HTTP {} (retries exhausted)", final_resp.status));

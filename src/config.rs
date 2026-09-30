@@ -193,6 +193,16 @@ pub fn load_from(path: &Path, env: &[(String, String)], cli: &CliOverrides) -> R
         cfg.max_redirs = *v;
     }
 
+    // Empty/whitespace contact strings mean "unset" at every layer (the env
+    // layer filters them on read; normalize file and flag layers the same
+    // way) — otherwise an empty `--contact-email "$VAR"` with an unset
+    // shell variable would slip past the fail-closed contact gate and send
+    // an effectively anonymous User-Agent.
+    let non_empty = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    cfg.contact_email = non_empty(cfg.contact_email);
+    cfg.contact_page = non_empty(cfg.contact_page);
+    cfg.user_agent = non_empty(cfg.user_agent);
+
     Ok(cfg)
 }
 

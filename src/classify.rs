@@ -44,6 +44,12 @@ pub enum HostClass {
     OtherServices,
 }
 
+/// Any 5xx from an other-services host arms the 15-minute cooldown (and is
+/// never retried). Pure so the policy decision is unit-tested directly.
+pub fn cooldown_triggered(status: u16, class: HostClass) -> bool {
+    class == HostClass::OtherServices && status >= 500
+}
+
 /// Label-anchored under `*.wikimedia.org`: the hostname must be exactly one
 /// of `gerrit.` / `gitlab.` / `phabricator.` / `lists.` + `wikimedia.org`.
 /// Never a raw substring match — `lists.example.org` must NOT match.
@@ -147,5 +153,24 @@ mod tests {
             host_class("GERRIT.Wikimedia.org."),
             HostClass::OtherServices
         );
+    }
+
+    #[test]
+    fn cooldown_policy() {
+        // Any 5xx from an other-services host arms the cooldown; nothing
+        // else does.
+        for status in [500u16, 502, 503, 504] {
+            assert!(
+                cooldown_triggered(status, HostClass::OtherServices),
+                "{status}"
+            );
+            assert!(!cooldown_triggered(status, HostClass::Default), "{status}");
+        }
+        for status in [200u16, 301, 404, 429] {
+            assert!(
+                !cooldown_triggered(status, HostClass::OtherServices),
+                "{status}"
+            );
+        }
     }
 }

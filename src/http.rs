@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use url::Url;
 
-use crate::classify::{host_class, is_api_exempt, surface, HostClass, Surface};
+use crate::classify::{cooldown_triggered, host_class, is_api_exempt, surface, HostClass, Surface};
 use crate::config::Config;
 use crate::maxlag;
 use crate::pacing::{self, fmt_hhmm};
@@ -184,7 +184,7 @@ impl Session {
         }
     }
 
-    fn retry_after_secs(&self, headers: &reqwest::header::HeaderMap, attempt: usize) -> f64 {
+    fn retry_after_secs(headers: &reqwest::header::HeaderMap, attempt: usize) -> f64 {
         let raw = headers
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
@@ -310,7 +310,7 @@ impl Session {
             if status == 429 || status == 503 {
                 // Same backoff as the target URL. An other-services 5xx is
                 // not retried: cooldown recorded, failure semantics govern.
-                if status == 503 && host_class(host) == HostClass::OtherServices {
+                if cooldown_triggered(status, host_class(host)) {
                     let until = pacing::record_cooldown(&self.state_dir, host);
                     eprintln!(
                         "wm-fetch: HTTP 503 fetching robots.txt from {host}; Robot policy requires a ≥15-minute pause; retry after {}",
@@ -322,7 +322,7 @@ impl Session {
                     return Ok(self.robots_failure(host));
                 }
                 let (hdrs, _) = Self::body_of(resp)?;
-                let wait = self.retry_after_secs(&hdrs, attempt);
+                let wait = Self::retry_after_secs(&hdrs, attempt);
                 self.budget_check(Duration::from_secs_f64(wait), "robots.txt retry backoff")?;
                 eprintln!(
                     "wm-fetch: HTTP {status} fetching robots.txt, backing off {wait:.0}s (attempt {attempt}/{attempts})"
@@ -340,7 +340,15 @@ impl Session {
             if (400..500).contains(&status) {
                 return Ok(RobotsFetch::NotFound);
             }
-            // 5xx and anything else: fail-closed path.
+            // Remaining failures (any 5xx, odd statuses). A 5xx from an
+            // other-services host arms the cooldown on the way out.
+            if cooldown_triggered(status, host_class(host)) {
+                let until = pacing::record_cooldown(&self.state_dir, host);
+                eprintln!(
+                    "wm-fetch: HTTP {status} fetching robots.txt from {host}; Robot policy requires a ≥15-minute pause; retry after {}",
+                    fmt_hhmm(until)
+                );
+            }
             return Ok(self.robots_failure(host));
         }
     }
@@ -386,16 +394,23 @@ impl Session {
                                 self.cfg.max_redirs
                             )));
                         }
-                        current = next;
+                        // Action API redirect targets get maxlag too — a
+                        // hop landing on api.php must not lose injection.
+                        let injected = maxlag::inject(next.as_str(), self.cfg.maxlag);
+                        current = Url::parse(&injected).map_err(|e| {
+                            Fail::Fatal(format!("redirect target unparseable: {e}"))
+                        })?;
                         continue;
                     }
                     None => {
+                        // A 3xx without a parseable Location is not
+                        // actionable — surface it as a failure.
                         let (hdrs, body) = Self::body_of(resp)?;
                         let _ = hdrs;
                         return Ok(Final {
                             status,
                             body,
-                            failure: false,
+                            failure: true,
                         });
                     }
                 }
@@ -404,7 +419,7 @@ impl Session {
             // 429/503 with Retry-After backoff.
             if status == 429 || status == 503 {
                 let host = current.host_str().unwrap_or_default().to_string();
-                if status == 503 && host_class(&host) == HostClass::OtherServices {
+                if cooldown_triggered(status, host_class(&host)) {
                     // Other-services 5xx: never retried; cooldown recorded.
                     let (_, body) = Self::body_of(resp)?;
                     let until = pacing::record_cooldown(&self.state_dir, &host);
@@ -427,7 +442,7 @@ impl Session {
                         failure: true,
                     });
                 }
-                let wait = self.retry_after_secs(&hdrs, attempt);
+                let wait = Self::retry_after_secs(&hdrs, attempt);
                 self.budget_check(Duration::from_secs_f64(wait), "retry backoff")?;
                 eprintln!(
                     "wm-fetch: HTTP {status}, backing off {wait:.0}s (attempt {attempt}/{attempts})"
@@ -435,6 +450,23 @@ impl Session {
                 std::thread::sleep(Duration::from_secs_f64(wait));
                 attempt += 1;
                 continue;
+            }
+
+            // Any other 5xx from an other-services host: not retried (only
+            // 429/503 retry above), and the 15-minute cooldown is armed.
+            if cooldown_triggered(status, host_class(current.host_str().unwrap_or_default())) {
+                let host = current.host_str().unwrap_or_default().to_string();
+                let (_, body) = Self::body_of(resp)?;
+                let until = pacing::record_cooldown(&self.state_dir, &host);
+                eprintln!(
+                    "wm-fetch: HTTP {status} from {host}; Robot policy requires a ≥15-minute pause; retry after {}",
+                    fmt_hhmm(until)
+                );
+                return Ok(Final {
+                    status,
+                    body,
+                    failure: true,
+                });
             }
 
             // Action API maxlag: the lag error arrives as HTTP 200 JSON.
@@ -454,7 +486,7 @@ impl Session {
                             failure: true,
                         });
                     }
-                    let wait = self.retry_after_secs(&hdrs, attempt).max(5.0);
+                    let wait = Self::retry_after_secs(&hdrs, attempt).max(5.0);
                     self.budget_check(Duration::from_secs_f64(wait), "maxlag backoff")?;
                     eprintln!(
                         "wm-fetch: maxlag error ({}), waiting {wait:.0}s (attempt {attempt}/{attempts})",
@@ -478,5 +510,35 @@ impl Session {
                 failure: false,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn retry_after_parsing() {
+        use super::Session;
+        let mut h = reqwest::header::HeaderMap::new();
+        // Missing header → exponential fallback 2^attempt.
+        assert_eq!(Session::retry_after_secs(&h, 1), 2.0);
+        assert_eq!(Session::retry_after_secs(&h, 3), 8.0);
+
+        // Numeric seconds.
+        h.insert(reqwest::header::RETRY_AFTER, "3".parse().unwrap());
+        assert_eq!(Session::retry_after_secs(&h, 1), 3.0);
+        h.insert(reqwest::header::RETRY_AFTER, "0".parse().unwrap());
+        assert_eq!(Session::retry_after_secs(&h, 2), 0.0);
+
+        // HTTP-date form: 60s in the future.
+        let fut = httpdate::fmt_http_date(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+        );
+        h.insert(reqwest::header::RETRY_AFTER, fut.parse().unwrap());
+        let got = Session::retry_after_secs(&h, 3);
+        assert!((57.0..=60.0).contains(&got), "{got}");
+
+        // Garbage → exponential.
+        h.insert(reqwest::header::RETRY_AFTER, "soon".parse().unwrap());
+        assert_eq!(Session::retry_after_secs(&h, 3), 8.0);
     }
 }

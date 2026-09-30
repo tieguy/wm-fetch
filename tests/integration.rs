@@ -126,6 +126,29 @@ async fn no_contact_no_request() {
 }
 
 #[tokio::test]
+async fn empty_contact_is_no_contact() {
+    // Regression: an empty/whitespace --contact-email (e.g. an unset shell
+    // variable) must be treated as no contact — never an anonymous UA.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/wiki/Article"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("nope"))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    for empty in ["", "   "] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run(isolated(dir.path())
+            .arg(format!("{}/wiki/Article", server.uri()))
+            .arg("--contact-email")
+            .arg(empty));
+        assert_eq!(code(&out), 2, "empty={empty:?} stderr: {}", stderr(&out));
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn user_agent_override_no_contact() {
     let server = MockServer::start().await;
     allow_robots(&server).await;

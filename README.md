@@ -22,7 +22,7 @@ wm-fetch "https://en.wikipedia.org/w/api.php?action=query&meta=siteinfo&format=j
 | Rule | What wm-fetch does | Source |
 |---|---|---|
 | Identify yourself | Every request carries `wm-fetch-bot/<ver> (<your contact>) reqwest/<ver>` — client name, version, contact info, HTTP library. Refuses to run at all (exit 2) if no contact is configured. The default client name contains "bot" so WMF can classify the traffic. | [User-Agent policy](https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_User-Agent_Policy) |
-| Action API: use maxlag | `maxlag=5` (configurable) is appended to api.php URLs that lack one; **the HTTP-200 maxlag error form** (a JSON `error.code == "maxlag"` body with `Retry-After`/`X-Database-Lag` headers) is detected, waited out ≥5s, and retried. | [Manual:Maxlag parameter](https://www.mediawiki.org/wiki/Manual:Maxlag_parameter), [API:Etiquette](https://www.mediawiki.org/wiki/API:Etiquette) |
+| Action API: use maxlag | `maxlag=5` (configurable) is appended to api.php URLs that lack one — including redirect hops that land on api.php; **the HTTP-200 maxlag error form** (a JSON `error.code == "maxlag"` body with `Retry-After`/`X-Database-Lag` headers) is detected, waited out ≥5s, and retried. (The `format=xml` error form is not sniffed — callers use JSON.) | [Manual:Maxlag parameter](https://www.mediawiki.org/wiki/Manual:Maxlag_parameter), [API:Etiquette](https://www.mediawiki.org/wiki/API:Etiquette) |
 | Always gzip | `Accept-Encoding: gzip` on every request. | [Robot policy](https://wikitech.wikimedia.org/wiki/Robot_policy) |
 | Respect 429 | 429/503 responses back off per `Retry-After` (numeric or HTTP-date), else exponential (2, 4, 8, 16s), then give up loudly with the last body on stdout. | [Robot policy](https://wikitech.wikimedia.org/wiki/Robot_policy) |
 | Serial requests / concurrency limits | One URL per invocation, and a file lock serializes simultaneous wm-fetch processes on the same machine (concurrency 1 across your agent sessions). | [Robot policy](https://wikitech.wikimedia.org/wiki/Robot_policy), [API:Etiquette](https://www.mediawiki.org/wiki/API:Etiquette) |
@@ -129,12 +129,22 @@ Precedence: CLI flags > `WM_FETCH_*` environment variables > config file
 contact_email  = "you@example.org"
 contact_page   = "https://en.wikipedia.org/wiki/User:YourName"
 client_name    = "wm-fetch-bot"
+user_agent     = "…"   # full UA replacement (config-file form of --user-agent; same obligation + warning)
 retries        = 4
 max_time       = 60
 connect_timeout = 10
 max_redirs     = 3
 maxlag         = 5
 ```
+
+Environment: `WM_FETCH_CONTACT_EMAIL`, `WM_FETCH_CONTACT_PAGE`,
+`WM_FETCH_CLIENT_NAME`, `WM_FETCH_USER_AGENT`, `WM_FETCH_MAXLAG`,
+`WM_FETCH_RETRIES`, `WM_FETCH_MAX_TIME`, `WM_FETCH_CONNECT_TIMEOUT`,
+`WM_FETCH_MAX_REDIRS`, plus `WM_FETCH_CONFIG` (config path) and
+`WM_FETCH_STATE_DIR` (pacing/lock/robots-cache directory, default
+`~/.cache/wm-fetch` — pointing it at a fresh directory per invocation
+disables cross-invocation pacing, so leave it alone unless you are
+testing).
 
 **Configuration changes identity or timing — never compliance.** The
 User-Agent construction, robots.txt enforcement, and pacing floors cannot
@@ -152,7 +162,7 @@ the exact bug this rule exists to prevent.
 ## Install
 
 Release binaries are attached to [GitHub releases](https://github.com/tieguy/wm-fetch/releases)
-(Linux x86_64, statically linked). Or with a Rust toolchain:
+(Linux x86_64 statically-linked musl, and aarch64). Or with a Rust toolchain:
 
 ```sh
 cargo install --git https://github.com/tieguy/wm-fetch
