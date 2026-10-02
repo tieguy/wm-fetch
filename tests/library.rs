@@ -317,3 +317,43 @@ async fn robots_record_only_fetches_and_records() {
     }
     server2.verify().await;
 }
+
+// Staged addition to wm-fetch tests/library.rs: regression test for the
+// robots.txt redirect-hop gate (Phase 2 review round 2).
+#[tokio::test(flavor = "multi_thread")]
+async fn robots_redirect_hop_is_gated() {
+    // robots.txt redirects to a non-public IP literal. With the SSRF
+    // guard enabled, the redirect hop is refused before any connection —
+    // proving fetch_robots's loop runs gate_hop (regression test for the
+    // Phase 2 review finding: removing the gate must fail this test).
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/robots.txt"))
+        .respond_with(
+            ResponseTemplate::new(301).insert_header("Location", "http://10.255.255.1/robots.txt"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/wiki/x"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("x"))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let options = SessionOptions {
+        refuse_internal_addresses: true,
+        ..SessionOptions::default()
+    };
+    let url = url::Url::parse(&format!("{}/wiki/x", server.uri())).unwrap();
+    let result = blocking(move || {
+        let mut session = Session::connect_with(cfg(), state_dir("robotsredir"), options).unwrap();
+        session.fetch(&url)
+    })
+    .await;
+    match result {
+        Err(Fail::Policy(msg)) => assert!(msg.contains("SSRF"), "{msg}"),
+        other => panic!("expected the gated robots redirect to be refused, got {other:?}"),
+    }
+    server.verify().await;
+}
