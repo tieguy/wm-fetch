@@ -15,7 +15,13 @@ cargo fmt && cargo clippy --all-targets -- -D warnings   # CI enforces both
 - **Compliance is non-negotiable.** Do not add configuration that can
   disable the User-Agent construction, robots.txt enforcement, or pacing
   floors. Config changes identity or timing, never compliance. The
-  fail-closed contact gate (no contact → exit 2) is the product.
+  fail-closed contact gate (no contact → exit 2) is the product — it now
+  lives in the library constructor (`Session::connect_with`), so CLI and
+  library consumers share one gate. `RobotsMode::RecordOnly` is the one
+  deliberate library-level exception: a downstream tool owns its robots
+  posture with the verdict recorded on every result; the CLI and the
+  library default stay `Enforce`, and wm-fetch itself never fetches past
+  a disallow.
 - Policy sources (verified live 2026-09-30; CI link-checks them):
   [Robot policy](https://wikitech.wikimedia.org/wiki/Robot_policy),
   [UA policy](https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_User-Agent_Policy),

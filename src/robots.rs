@@ -17,6 +17,26 @@ pub enum Verdict {
     Disallowed,
 }
 
+/// A robots.txt verdict as recorded on a result: the verdict itself plus
+/// which rules matched. For record-only consumers
+/// (`SessionOptions::robots_mode`); `NoRobots` means robots.txt could not
+/// be fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReportVerdict {
+    Allowed,
+    Disallowed,
+    NoRobots,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    pub verdict: ReportVerdict,
+    /// The matching rule lines, longest first (e.g.
+    /// `disallow: /wiki/Special:`). Empty for 4xx robots.txt (allow-all)
+    /// and unreachability.
+    pub matched_rules: Vec<String>,
+}
+
 /// Match a URL against a robots.txt body for `product` (e.g. "wm-fetch-bot").
 /// An unparseable 2xx body is treated as allow-all (RFC 9309 §2.3.1).
 pub fn evaluate(body: &str, product: &str, target: &Url) -> Verdict {
@@ -35,6 +55,161 @@ pub fn evaluate(body: &str, product: &str, target: &Url) -> Verdict {
 pub fn crawl_delay_ms(body: &str, product: &str) -> Option<u64> {
     let robot = texting_robots::Robot::new(product, body.as_bytes()).ok()?;
     robot.delay.map(|secs| (secs * 1000.0).round() as u64)
+}
+
+/// Approximate extraction of the robots.txt rules that matched `target`
+/// for `product`, for recording alongside a verdict. The verdict itself
+/// always comes from [`evaluate`] (texting_robots); this helper re-parses
+/// the common rule forms (exact prefix with `*` and `$` wildcards) and may
+/// miss exotic ones. Rule lines are returned longest-first.
+pub fn matched_rules(body: &str, product: &str, target: &Url) -> Vec<String> {
+    let groups = parse_groups(body);
+    let Some(rules) = select_group(&groups, product) else {
+        return Vec::new();
+    };
+    let mut path_q = percent_decode(target.path());
+    if let Some(q) = target.query() {
+        path_q.push('?');
+        path_q.push_str(&percent_decode(q));
+    }
+    let mut matched: Vec<String> = rules
+        .iter()
+        .filter(|(kind, rule)| {
+            (kind == "allow" || kind == "disallow") && rule_matches(rule, &path_q)
+        })
+        .map(|(kind, rule)| format!("{kind}: {rule}"))
+        .collect();
+    matched.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    matched
+}
+
+/// One robots.txt group: the user-agent tokens it was declared for, plus
+/// its rule lines as `(kind, value)` pairs.
+struct Group {
+    agents: Vec<String>,
+    rules: Vec<(String, String)>,
+}
+
+fn parse_groups(body: &str) -> Vec<Group> {
+    let mut groups: Vec<Group> = Vec::new();
+    let mut prev_was_agent = false;
+    for raw in body.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            prev_was_agent = false;
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().to_string();
+        match key.as_str() {
+            "user-agent" => {
+                if !prev_was_agent {
+                    groups.push(Group {
+                        agents: Vec::new(),
+                        rules: Vec::new(),
+                    });
+                }
+                groups
+                    .last_mut()
+                    .expect("group just pushed")
+                    .agents
+                    .push(value.to_ascii_lowercase());
+                prev_was_agent = true;
+            }
+            "allow" | "disallow" | "crawl-delay" => {
+                if let Some(group) = groups.last_mut() {
+                    group.rules.push((key, value));
+                }
+                prev_was_agent = false;
+            }
+            _ => prev_was_agent = false,
+        }
+    }
+    groups
+}
+
+/// Spec behaviour: the group matching the product token exactly wins; if
+/// none, the `*` group applies.
+fn select_group<'a>(groups: &'a [Group], product: &str) -> Option<&'a [(String, String)]> {
+    let product = product.to_ascii_lowercase();
+    let wildcard = groups.iter().find(|g| g.agents.iter().any(|a| a == "*"));
+    let chosen = groups
+        .iter()
+        .find(|g| g.agents.contains(&product))
+        .or(wildcard)?;
+    Some(&chosen.rules)
+}
+
+/// Robots rule matching: pattern anchored at the start of the target,
+/// `*` matches any run of characters, a trailing `$` requires the match to
+/// reach the end of the target.
+fn rule_matches(pattern: &str, target: &str) -> bool {
+    let mut pat: Vec<char> = pattern.chars().collect();
+    let mut anchored_end = false;
+    if pat.last() == Some(&'$') {
+        pat.pop();
+        anchored_end = true;
+    }
+    let text: Vec<char> = target.chars().collect();
+    let (mut p, mut t) = (0usize, 0usize);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    loop {
+        if p == pat.len() {
+            if !anchored_end || t == text.len() {
+                return true;
+            }
+        } else if pat[p] == '*' {
+            star = p;
+            mark = t;
+            p += 1;
+            continue;
+        } else if t < text.len() && pat[p] == text[t] {
+            p += 1;
+            t += 1;
+            continue;
+        }
+        if star != usize::MAX {
+            p = star + 1;
+            mark += 1;
+            t = mark;
+            continue;
+        }
+        return false;
+    }
+}
+
+/// Minimal percent-decoding for rule comparison (Wikimedia disallows
+/// `Special:` but URLs arrive percent-encoded as `Special%3A`).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3).and_then(|h| {
+                std::str::from_utf8(h)
+                    .ok()
+                    .and_then(|h| u8::from_str_radix(h, 16).ok())
+            });
+            match hex {
+                Some(b) => {
+                    out.push(b);
+                    i += 3;
+                }
+                None => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn cache_path(state_dir: &Path, host: &str) -> PathBuf {
@@ -126,6 +301,67 @@ mod tests {
             &Url::parse("https://h/x").unwrap(),
         );
         assert_eq!(v, Verdict::Allowed);
+    }
+
+    #[test]
+    fn matched_rules_extraction() {
+        let u = |p: &str| Url::parse(&format!("https://en.wikipedia.org{p}")).unwrap();
+        // Wildcard group, plain prefix.
+        assert_eq!(
+            matched_rules(WIKIMEDIA_ROBOTS, "wm-fetch-bot", &u("/wiki/Special:Export")),
+            vec!["disallow: /wiki/Special:".to_string()]
+        );
+        // Percent-encoded target decodes for comparison.
+        assert_eq!(
+            matched_rules(
+                WIKIMEDIA_ROBOTS,
+                "wm-fetch-bot",
+                &u("/wiki/Special%3AExport")
+            ),
+            vec!["disallow: /wiki/Special:".to_string()]
+        );
+        // Allowed path: the disallow rules do not match → no rules.
+        assert!(matched_rules(WIKIMEDIA_ROBOTS, "wm-fetch-bot", &u("/wiki/Foo")).is_empty());
+
+        // Wildcards and the exact-group preference.
+        let body = "User-agent: *\nDisallow: /a\n\nUser-agent: wm-fetch-bot\nDisallow: /b/*\n";
+        assert_eq!(
+            matched_rules(body, "wm-fetch-bot", &u("/b/x")),
+            vec!["disallow: /b/*".to_string()]
+        );
+        assert_eq!(
+            matched_rules(body, "wm-fetch-bot", &u("/a")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            matched_rules(body, "other-bot", &u("/a")),
+            vec!["disallow: /a".to_string()]
+        );
+
+        // `$` anchor: /foo$ does not match /foobar.
+        let anchored = "User-agent: *\nDisallow: /foo$\n";
+        assert_eq!(
+            matched_rules(anchored, "wm-fetch-bot", &u("/foo")),
+            vec!["disallow: /foo$".to_string()]
+        );
+        assert!(matched_rules(anchored, "wm-fetch-bot", &u("/foobar")).is_empty());
+    }
+
+    #[test]
+    fn rule_matching_basics() {
+        use super::rule_matches;
+        assert!(rule_matches("/wiki/", "/wiki/Foo"));
+        assert!(!rule_matches("/wiki/", "/w/Foo"));
+        assert!(rule_matches("", "/anything"));
+        assert!(rule_matches("/*/x", "/a/b/x"));
+        assert!(rule_matches("/foo$", "/foo"));
+        assert!(!rule_matches("/foo$", "/foobar"));
+    }
+
+    #[test]
+    fn percent_decoding() {
+        assert_eq!(super::percent_decode("Special%3AExport"), "Special:Export");
+        assert_eq!(super::percent_decode("%zz"), "%zz");
     }
 
     #[test]

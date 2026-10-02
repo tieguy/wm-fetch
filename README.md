@@ -183,6 +183,47 @@ properties, a snippet like this does the job:
 > respect the refusal — do not retry the same URL, use the API or dumps
 > instead as the message suggests.
 
+## Library use
+
+Since 2.1 the crate is also a library (`wm_fetch`); the binary is a thin
+CLI over it. Library consumers inherit the same policy spine — most
+importantly the **fail-closed contact gate lives in the constructor**:
+`Session::connect(cfg, state_dir)` (and `connect_with` for options)
+refuses to build without configured contact, and constructs the UA itself.
+
+```rust,ignore
+use wm_fetch::http::{Session, SessionOptions, RobotsMode};
+
+let session = Session::connect_with(cfg, state_dir, SessionOptions {
+    raw_capture: true,                    // wire bytes + per-hop headers
+    refuse_internal_addresses: true,      // SSRF guard (SP42-style)
+    max_body_bytes: Some(50 * 1024 * 1024),
+    robots_mode: RobotsMode::RecordOnly,  // record the verdict, fetch anyway
+    ..Default::default()
+})?;
+let final_resp = session.fetch(&url)?;
+```
+
+- `raw_capture` disables gzip auto-decoding and returns the body as
+  received on the wire plus per-hop records (request headers set, status,
+  response headers), so WARC archives match their `Content-Encoding`;
+  `wm_fetch::http::decode_body` decodes.
+- `refuse_internal_addresses` refuses IP-literal targets and hosts whose
+  DNS resolves only to non-public addresses, per hop (ported from SP42's
+  SSRF resolver guard, including IPv4-mapped-IPv6 unwrapping).
+- `max_body_bytes` caps each HTTP response; an over-cap response fails
+  with no partial body.
+- `robots_mode: RecordOnly` consults robots.txt, applies crawl-delay
+  pacing, records the verdict (allowed / disallowed / no-robots, plus the
+  matched rule lines) on the result — and fetches anyway. The CLI and the
+  library default remain `Enforce`: disallow → exit-3-equivalent
+  refusal, fail-closed on unreachable robots.txt. Record-only exists so a
+  downstream tool can own its robots posture with recording built in;
+  wm-fetch itself never fetches past a disallow.
+
+The state directory is an explicit `Session` parameter; the `WM_FETCH_STATE_DIR`
+environment variable remains the CLI's mechanism.
+
 ## Prior art: when to use what
 
 wm-fetch's niche is narrow: one-shot, agent-callable fetching where the

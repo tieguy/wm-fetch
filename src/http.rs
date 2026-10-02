@@ -2,6 +2,13 @@
 //! fetching. Every outbound request — target, robots.txt, redirect hops —
 //! goes through the same pacing/lock/state machinery. No request kind is
 //! exempt.
+//!
+//! The library entry point is [`Session::connect`], which refuses to build
+//! without configured operator contact (the fail-closed UA gate) and takes
+//! the state directory as an explicit parameter. [`SessionOptions`] lets a
+//! library consumer opt into raw wire capture, internal-address refusal, a
+//! per-response body cap, and record-only robots mode — the CLI uses the
+//! defaults, which preserve its historical behaviour.
 
 use std::fs;
 use std::io::Read;
@@ -14,7 +21,8 @@ use crate::classify::{cooldown_triggered, host_class, is_api_exempt, surface, Ho
 use crate::config::Config;
 use crate::maxlag;
 use crate::pacing::{self, fmt_hhmm};
-use crate::robots::{self, Verdict};
+use crate::robots::{self, Report, ReportVerdict, Verdict};
+use crate::ssrf;
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_FAIL: i32 = 1;
@@ -24,24 +32,126 @@ pub const EXIT_POLICY: i32 = 3;
 /// Errors that end the invocation.
 #[derive(Debug)]
 pub enum Fail {
+    /// Exit 2: configuration problem — in practice, no operator contact
+    /// configured (the fail-closed UA gate refused to build a session).
+    Config(String),
     /// Exit 1: transport failure, HTTP error after retries.
     Fatal(String),
     /// Exit 1: the wall-clock --max-time budget could not cover a required
     /// wait (pacing, lock, backoff). Distinct from Fatal so robots-fetch
     /// error handling does not swallow it into "robots.txt unreachable".
     Budget(String),
-    /// Exit 3: policy refusal — robots.txt disallow, robots.txt unreachable
-    /// after cache fallback, or other-services 5xx cooldown.
+    /// Exit 3: policy refusal — robots.txt disallow (enforce mode),
+    /// robots.txt unreachable after cache fallback (enforce mode),
+    /// other-services 5xx cooldown, or an internal-address target.
     Policy(String),
+    /// Exit 1: the response body exceeded the configured per-response cap.
+    /// No partial body is returned.
+    TooLarge { limit: u64, observed: u64 },
 }
 
+/// How robots.txt verdicts are handled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RobotsMode {
+    /// Disallowed targets are refused (exit 3); unreachable robots.txt is
+    /// fail-closed. The CLI default and the library default.
+    #[default]
+    Enforce,
+    /// The robots.txt verdict is consulted, paced (crawl-delay still
+    /// applies), recorded on the result — and the fetch proceeds anyway.
+    /// Lets a downstream tool own its robots posture with recording built
+    /// in (citation-fetcher uses this for non-Wikimedia cited sources).
+    RecordOnly,
+}
+
+/// Library-consumer options. Defaults preserve CLI behaviour exactly.
+#[derive(Debug, Clone, Default)]
+pub struct SessionOptions {
+    /// Robots handling. Default [`RobotsMode::Enforce`].
+    pub robots_mode: RobotsMode,
+    /// Return the response body as received on the wire (gzip
+    /// auto-decoding disabled) with per-hop header records, so WARC
+    /// records match their `Content-Encoding`. Use [`decode_body`] to
+    /// decode. Default false.
+    pub raw_capture: bool,
+    /// Refuse IP-literal targets and redirect hops that resolve to
+    /// non-public addresses (SSRF guard, ported from SP42). Default false
+    /// (the CLI talks to Wikimedia hosts; the guard is opt-in).
+    pub refuse_internal_addresses: bool,
+    /// Per-HTTP-response body cap in bytes. A response that exceeds it
+    /// yields [`Fail::TooLarge`] with no partial body. Default: no cap.
+    pub max_body_bytes: Option<u64>,
+}
+
+/// One outbound hop of a fetch: the request headers we set, the status, and
+/// the response headers as received.
+#[derive(Debug, Clone)]
+pub struct Hop {
+    pub url: Url,
+    /// Headers explicitly set on the request (User-Agent; reqwest's
+    /// automatic Accept-Encoding is not observable here).
+    pub request_headers: Vec<(String, String)>,
+    pub status: u16,
+    pub response_headers: reqwest::header::HeaderMap,
+}
+
+/// The robots verdict consulted for the final hop, when robots.txt was
+/// consulted at all (API-exempt surfaces are None).
+pub type RobotsReport = Report;
+
+#[derive(Debug)]
 pub struct Final {
     pub status: u16,
+    /// Decoded body, or — in raw-capture mode — the body as received on
+    /// the wire (see [`SessionOptions::raw_capture`] and [`decode_body`]).
     pub body: Vec<u8>,
     /// True when the response is being returned only because retries were
     /// exhausted (e.g. a persistent HTTP-200 maxlag error): body still goes
     /// to stdout, but the invocation is a failure (exit 1).
     pub failure: bool,
+    /// Every outbound hop of this fetch (redirect chain, final response).
+    pub hops: Vec<Hop>,
+    /// The robots.txt verdict for the final hop, when consulted.
+    pub robots: Option<RobotsReport>,
+}
+
+/// Decode a wire-captured body according to its `Content-Encoding`.
+/// `identity` (or absent) passes through; `gzip` is decompressed.
+///
+/// # Errors
+/// Returns a message for unsupported encodings or corrupt gzip data.
+pub fn decode_body(headers: &reqwest::header::HeaderMap, body: &[u8]) -> Result<Vec<u8>, String> {
+    let enc = headers
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("identity")
+        .trim()
+        .to_ascii_lowercase();
+    match enc.as_str() {
+        "" | "identity" => Ok(body.to_vec()),
+        "gzip" | "x-gzip" => {
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(body)
+                .read_to_end(&mut out)
+                .map_err(|e| format!("gunzip: {e}"))?;
+            Ok(out)
+        }
+        other => Err(format!("unsupported content-encoding {other:?}")),
+    }
+}
+
+/// Format an error with its full source chain, so resolver-level refusals
+/// (e.g. the SSRF guard's "host resolved only to non-public addresses")
+/// stay visible instead of hiding behind reqwest's top-level message.
+fn format_error_chain(e: &dyn std::error::Error) -> String {
+    let mut msg = e.to_string();
+    let mut source = e.source();
+    while let Some(s) = source {
+        msg.push_str("; caused by: ");
+        msg.push_str(&s.to_string());
+        source = s.source();
+    }
+    msg
 }
 
 pub struct Session {
@@ -51,6 +161,11 @@ pub struct Session {
     deadline: Instant,
     client: reqwest::blocking::Client,
     crawl_delays: robots::CrawlDelays,
+    options: SessionOptions,
+    /// Per-fetch accumulation: redirect hops of the current fetch().
+    hops: Vec<Hop>,
+    /// Per-fetch accumulation: robots verdict consulted for the final hop.
+    robots_report: Option<RobotsReport>,
     /// Held for the whole invocation ⇒ concurrent wm-fetch processes
     /// serialize (Robot policy: concurrency 1). Blocking bounded by the
     /// --max-time budget.
@@ -66,11 +181,88 @@ enum RobotsFetch {
 }
 
 impl Session {
-    pub fn new(cfg: Config, ua: String, state_dir: PathBuf) -> Result<Self, Fail> {
+    /// Build a session with default options. The constructor refuses to
+    /// build without configured contact, so library consumers inherit the
+    /// UA policy automatically.
+    ///
+    /// # Errors
+    /// [`Fail::Config`] when no contact is configured (and no custom UA);
+    /// see [`Session::connect_with`].
+    pub fn connect(cfg: Config, state_dir: PathBuf) -> Result<Self, Fail> {
+        Self::connect_with(cfg, state_dir, SessionOptions::default())
+    }
+
+    /// Build a session with explicit options. The fail-closed contact gate
+    /// runs here: `cfg` must carry a `user_agent`, `contact_email`, or
+    /// `contact_page`. The UA is constructed inside, never passed in, so
+    /// no consumer can bypass the policy by accident.
+    ///
+    /// # Errors
+    /// [`Fail::Config`] without contact; [`Fail::Fatal`] when the HTTP
+    /// client or the lock cannot be built; [`Fail::Budget`] when the lock
+    /// wait exceeds `--max-time`.
+    pub fn connect_with(
+        cfg: Config,
+        state_dir: PathBuf,
+        options: SessionOptions,
+    ) -> Result<Self, Fail> {
+        // Fail-closed contact gate: never send an anonymous request. This
+        // is the fix for the "fork ships the upstream author's contact"
+        // bug — a fresh fork refuses to run until the operator configures
+        // their own.
+        if cfg.user_agent.is_none() && cfg.contact_email.is_none() && cfg.contact_page.is_none() {
+            return Err(Fail::Config(
+                "no contact configured: the WMF User-Agent policy requires contact info in \
+                 every User-Agent. Set contact_email/contact_page (config file, \
+                 WM_FETCH_CONTACT_* env, or --contact-*), or pass --user-agent with your \
+                 own registered agent. Run `wm-fetch --init` to scaffold a config."
+                    .to_string(),
+            ));
+        }
+
+        if let Some(custom) = &cfg.user_agent {
+            if !crate::ua::has_contact_group(custom) {
+                eprintln!(
+                    "wm-fetch: custom --user-agent carries no parenthesized contact group; the UA \
+                     policy expects one. Sending it anyway — the obligation is yours."
+                );
+            }
+        }
+
+        let ua = cfg.user_agent.clone().unwrap_or_else(|| {
+            crate::ua::build(
+                &cfg.client_name,
+                cfg.contact_page.as_deref(),
+                cfg.contact_email.as_deref(),
+            )
+        });
+        Self::build(cfg, ua, state_dir, options)
+    }
+
+    fn build(
+        cfg: Config,
+        ua: String,
+        state_dir: PathBuf,
+        options: SessionOptions,
+    ) -> Result<Self, Fail> {
         let connect_timeout = Duration::from_secs_f64(cfg.connect_timeout_secs.max(0.1));
-        let client = reqwest::blocking::Client::builder()
+        let mut builder = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none()) // hops are driven manually
-            .connect_timeout(connect_timeout)
+            .connect_timeout(connect_timeout);
+        if options.raw_capture {
+            // Wire bytes: no automatic gzip negotiation/decoding, so the
+            // stored body matches its Content-Encoding.
+            builder = builder.gzip(false);
+        }
+        if options.refuse_internal_addresses {
+            // The resolver guard runs for every connection (including each
+            // manually driven redirect hop); no_proxy() keeps a deployment
+            // proxy from moving resolution out from under it.
+            builder = builder
+                .dns_resolver(std::sync::Arc::new(ssrf::GuardedResolver::system()))
+                .no_proxy();
+        }
+        let client = builder
             .build()
             .map_err(|e| Fail::Fatal(format!("building HTTP client: {e}")))?;
 
@@ -105,8 +297,17 @@ impl Session {
             deadline,
             client,
             crawl_delays: robots::CrawlDelays::default(),
+            options,
+            hops: Vec::new(),
+            robots_report: None,
             _lock: lock,
         })
+    }
+
+    /// The User-Agent this session sends.
+    #[must_use]
+    pub fn user_agent(&self) -> &str {
+        &self.ua
     }
 
     fn remaining(&self) -> Duration {
@@ -178,7 +379,10 @@ impl Session {
                 if e.is_timeout() {
                     Err(Fail::Fatal("request timed out (--max-time)".into()))
                 } else {
-                    Err(Fail::Fatal(format!("request failed: {e}")))
+                    Err(Fail::Fatal(format!(
+                        "request failed: {}",
+                        format_error_chain(&e)
+                    )))
                 }
             }
         }
@@ -207,11 +411,30 @@ impl Session {
 
     fn body_of(
         mut resp: reqwest::blocking::Response,
+        cap: Option<u64>,
     ) -> Result<(reqwest::header::HeaderMap, Vec<u8>), Fail> {
         let headers = resp.headers().clone();
         let mut body = Vec::new();
-        resp.read_to_end(&mut body)
-            .map_err(|e| Fail::Fatal(format!("reading response body: {e}")))?;
+        match cap {
+            None => {
+                resp.read_to_end(&mut body)
+                    .map_err(|e| Fail::Fatal(format!("reading response body: {e}")))?;
+            }
+            Some(limit) => {
+                // Read one byte past the cap to detect exceed without
+                // draining an unbounded body.
+                (&mut resp)
+                    .take(limit.saturating_add(1))
+                    .read_to_end(&mut body)
+                    .map_err(|e| Fail::Fatal(format!("reading response body: {e}")))?;
+                if body.len() as u64 > limit {
+                    return Err(Fail::TooLarge {
+                        limit,
+                        observed: body.len() as u64,
+                    });
+                }
+            }
+        }
         Ok((headers, body))
     }
 
@@ -234,15 +457,38 @@ impl Session {
             return Ok(());
         }
         match self.fetch_robots(&host, url)? {
-            RobotsFetch::NotFound => Ok(()), // RFC 9309: 4xx → allow-all
+            RobotsFetch::NotFound => {
+                // RFC 9309: 4xx → allow-all, no rules matched.
+                self.robots_report = Some(Report {
+                    verdict: ReportVerdict::Allowed,
+                    matched_rules: Vec::new(),
+                });
+                Ok(())
+            }
             RobotsFetch::Body(body) => {
                 let product = self.cfg.client_name.clone();
                 if let Some(delay) = robots::crawl_delay_ms(&body, &product) {
                     self.crawl_delays.set(&host, delay);
                 }
+                let rules = robots::matched_rules(&body, &product, url);
                 match robots::evaluate(&body, &product, url) {
-                    Verdict::Allowed => Ok(()),
+                    Verdict::Allowed => {
+                        self.robots_report = Some(Report {
+                            verdict: ReportVerdict::Allowed,
+                            matched_rules: rules,
+                        });
+                        Ok(())
+                    }
                     Verdict::Disallowed => {
+                        self.robots_report = Some(Report {
+                            verdict: ReportVerdict::Disallowed,
+                            matched_rules: rules,
+                        });
+                        if self.options.robots_mode == RobotsMode::RecordOnly {
+                            // Operator posture: record, fetch anyway.
+                            // Crawl-delay still applied above.
+                            return Ok(());
+                        }
                         let mut path = url.path().to_string();
                         if let Some(q) = url.query() {
                             path.push('?');
@@ -258,9 +504,18 @@ impl Session {
                     }
                 }
             }
-            RobotsFetch::Unreachable => Err(Fail::Policy(format!(
-                "robots.txt unreachable on {host} — refusing per RFC 9309; retry shortly"
-            ))),
+            RobotsFetch::Unreachable => match self.options.robots_mode {
+                RobotsMode::RecordOnly => {
+                    self.robots_report = Some(Report {
+                        verdict: ReportVerdict::NoRobots,
+                        matched_rules: Vec::new(),
+                    });
+                    Ok(())
+                }
+                RobotsMode::Enforce => Err(Fail::Policy(format!(
+                    "robots.txt unreachable on {host} — refusing per RFC 9309; retry shortly"
+                ))),
+            },
         }
     }
 
@@ -321,7 +576,7 @@ impl Session {
                 if attempt >= attempts {
                     return Ok(self.robots_failure(host));
                 }
-                let (hdrs, _) = Self::body_of(resp)?;
+                let (hdrs, _) = Self::body_of(resp, self.options.max_body_bytes)?;
                 let wait = Self::retry_after_secs(&hdrs, attempt);
                 self.budget_check(Duration::from_secs_f64(wait), "robots.txt retry backoff")?;
                 eprintln!(
@@ -332,7 +587,7 @@ impl Session {
                 continue;
             }
             if (200..300).contains(&status) {
-                let (_, body) = Self::body_of(resp)?;
+                let (_, body) = Self::body_of(resp, self.options.max_body_bytes)?;
                 let text = String::from_utf8_lossy(&body).into_owned();
                 robots::write_cache(&self.state_dir, host, &text);
                 return Ok(RobotsFetch::Body(text));
@@ -363,25 +618,43 @@ impl Session {
         }
     }
 
+    fn record_hop(&mut self, url: &Url, status: u16, headers: &reqwest::header::HeaderMap) {
+        self.hops.push(Hop {
+            url: url.clone(),
+            request_headers: vec![("user-agent".to_string(), self.ua.clone())],
+            status,
+            response_headers: headers.clone(),
+        });
+    }
+
     /// The main fetch loop: policy gate → paced request → retry/backoff →
     /// manual redirects → maxlag sniff. Returns the final response for
     /// output handling by the caller.
     pub fn fetch(&mut self, url: &Url) -> Result<Final, Fail> {
+        self.hops.clear();
+        self.robots_report = None;
         // `--retries N` means N retries: N+1 total attempts (>= 1).
         let attempts = self.cfg.max_retries + 1;
         let mut attempt = 1;
         let mut hops = 0;
         let mut current = url.clone();
         loop {
+            if self.options.refuse_internal_addresses && ssrf::host_is_blocked_literal(&current) {
+                return Err(Fail::Policy(format!(
+                    "SSRF: target {} is a non-public IP literal",
+                    current
+                )));
+            }
             self.policy_gate(&current)?;
             let resp = self.send_once(&current)?;
             let status = resp.status().as_u16();
+            let resp_headers = resp.headers().clone();
+            self.record_hop(&current, status, &resp_headers);
 
             // Manual redirect following: every hop is re-classified,
             // robots-checked, paced, and state-recorded.
             if (300..400).contains(&status) {
-                let loc = resp
-                    .headers()
+                let loc = resp_headers
                     .get(reqwest::header::LOCATION)
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
@@ -405,13 +678,14 @@ impl Session {
                     None => {
                         // A 3xx without a parseable Location is not
                         // actionable — surface it as a failure.
-                        let (hdrs, body) = Self::body_of(resp)?;
-                        let _ = hdrs;
-                        return Ok(Final {
+                        let (_, body) = Self::body_of(resp, self.options.max_body_bytes)?;
+                        return Ok(self.finalize(Final {
                             status,
                             body,
                             failure: true,
-                        });
+                            hops: Vec::new(),
+                            robots: None,
+                        }));
                     }
                 }
             }
@@ -421,26 +695,30 @@ impl Session {
                 let host = current.host_str().unwrap_or_default().to_string();
                 if cooldown_triggered(status, host_class(&host)) {
                     // Other-services 5xx: never retried; cooldown recorded.
-                    let (_, body) = Self::body_of(resp)?;
+                    let (_, body) = Self::body_of(resp, self.options.max_body_bytes)?;
                     let until = pacing::record_cooldown(&self.state_dir, &host);
                     eprintln!(
                         "wm-fetch: HTTP 503 from {host}; Robot policy requires a ≥15-minute pause; retry after {}",
                         fmt_hhmm(until)
                     );
-                    return Ok(Final {
+                    return Ok(self.finalize(Final {
                         status,
                         body,
                         failure: true,
-                    });
+                        hops: Vec::new(),
+                        robots: None,
+                    }));
                 }
-                let (hdrs, body) = Self::body_of(resp)?;
+                let (hdrs, body) = Self::body_of(resp, self.options.max_body_bytes)?;
                 if attempt >= attempts {
                     eprintln!("wm-fetch: giving up after {attempt} attempts (HTTP {status})");
-                    return Ok(Final {
+                    return Ok(self.finalize(Final {
                         status,
                         body,
                         failure: true,
-                    });
+                        hops: Vec::new(),
+                        robots: None,
+                    }));
                 }
                 let wait = Self::retry_after_secs(&hdrs, attempt);
                 self.budget_check(Duration::from_secs_f64(wait), "retry backoff")?;
@@ -456,22 +734,24 @@ impl Session {
             // 429/503 retry above), and the 15-minute cooldown is armed.
             if cooldown_triggered(status, host_class(current.host_str().unwrap_or_default())) {
                 let host = current.host_str().unwrap_or_default().to_string();
-                let (_, body) = Self::body_of(resp)?;
+                let (_, body) = Self::body_of(resp, self.options.max_body_bytes)?;
                 let until = pacing::record_cooldown(&self.state_dir, &host);
                 eprintln!(
                     "wm-fetch: HTTP {status} from {host}; Robot policy requires a ≥15-minute pause; retry after {}",
                     fmt_hhmm(until)
                 );
-                return Ok(Final {
+                return Ok(self.finalize(Final {
                     status,
                     body,
                     failure: true,
-                });
+                    hops: Vec::new(),
+                    robots: None,
+                }));
             }
 
             // Action API maxlag: the lag error arrives as HTTP 200 JSON.
             if status == 200 && surface(&current) == Surface::ActionApi {
-                let (hdrs, body) = Self::body_of(resp)?;
+                let (hdrs, body) = Self::body_of(resp, self.options.max_body_bytes)?;
                 if let Some(ml) = maxlag::sniff_error(&body) {
                     if let Some(lag) = hdrs.get("x-database-lag").and_then(|v| v.to_str().ok()) {
                         eprintln!("wm-fetch: X-Database-Lag: {lag}");
@@ -480,11 +760,13 @@ impl Session {
                         eprintln!(
                             "wm-fetch: giving up after {attempt} attempts (maxlag error persists)"
                         );
-                        return Ok(Final {
+                        return Ok(self.finalize(Final {
                             status,
                             body,
                             failure: true,
-                        });
+                            hops: Vec::new(),
+                            robots: None,
+                        }));
                     }
                     let wait = Self::retry_after_secs(&hdrs, attempt).max(5.0);
                     self.budget_check(Duration::from_secs_f64(wait), "maxlag backoff")?;
@@ -496,28 +778,40 @@ impl Session {
                     attempt += 1;
                     continue;
                 }
-                return Ok(Final {
+                return Ok(self.finalize(Final {
                     status,
                     body,
                     failure: false,
-                });
+                    hops: Vec::new(),
+                    robots: None,
+                }));
             }
 
-            let (_, body) = Self::body_of(resp)?;
-            return Ok(Final {
+            let (_, body) = Self::body_of(resp, self.options.max_body_bytes)?;
+            return Ok(self.finalize(Final {
                 status,
                 body,
                 failure: false,
-            });
+                hops: Vec::new(),
+                robots: None,
+            }));
         }
+    }
+
+    /// Attach the accumulated hops and robots report to a Final.
+    fn finalize(&mut self, mut final_resp: Final) -> Final {
+        final_resp.hops = std::mem::take(&mut self.hops);
+        final_resp.robots = self.robots_report.clone();
+        final_resp
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::Session;
+
     #[test]
     fn retry_after_parsing() {
-        use super::Session;
         let mut h = reqwest::header::HeaderMap::new();
         // Missing header → exponential fallback 2^attempt.
         assert_eq!(Session::retry_after_secs(&h, 1), 2.0);
@@ -540,5 +834,25 @@ mod tests {
         // Garbage → exponential.
         h.insert(reqwest::header::RETRY_AFTER, "soon".parse().unwrap());
         assert_eq!(Session::retry_after_secs(&h, 3), 8.0);
+    }
+
+    #[test]
+    fn decode_body_identity_and_gzip() {
+        use super::decode_body;
+        let mut h = reqwest::header::HeaderMap::new();
+        assert_eq!(decode_body(&h, b"plain").unwrap(), b"plain");
+        h.insert(reqwest::header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let mut gz = flate2::read::GzEncoder::new(
+            std::io::Cursor::new(b"compressed hello".to_vec()),
+            flate2::Compression::default(),
+        );
+        let mut wire = Vec::new();
+        std::io::Read::read_to_end(&mut gz, &mut wire).unwrap();
+        assert_eq!(
+            decode_body(&h, &wire).unwrap(),
+            b"compressed hello".to_vec()
+        );
+        h.insert(reqwest::header::CONTENT_ENCODING, "br".parse().unwrap());
+        assert!(decode_body(&h, b"x").is_err());
     }
 }

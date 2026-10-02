@@ -847,6 +847,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip_network"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa2f047c0a98b2f299aa5d6d7088443570faae494e9ae1305e48be000c9e0eb1"
+
+[[package]]
 name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2265,13 +2271,15 @@ dependencies = [
 
 [[package]]
 name = "wm-fetch"
-version = "2.0.2"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "flate2",
  "fs4",
  "httpdate",
+ "ip_network",
  "reqwest",
  "serde",
  "serde_json",

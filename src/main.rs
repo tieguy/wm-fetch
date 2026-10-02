@@ -9,20 +9,12 @@
 //!   3  policy refusal: robots.txt disallow, robots.txt unreachable after
 //!      cache fallback, or other-services 5xx cooldown
 
-mod classify;
-mod config;
-mod http;
-mod maxlag;
-mod pacing;
-mod robots;
-mod ua;
-
 use std::io::Write;
 use std::process::ExitCode;
 
 use clap::Parser;
-use config::CliOverrides;
-use http::{Fail, Session, EXIT_FAIL, EXIT_OK, EXIT_POLICY, EXIT_USAGE};
+use wm_fetch::config::{self, CliOverrides};
+use wm_fetch::http::{Fail, Session, SessionOptions, EXIT_FAIL, EXIT_OK, EXIT_POLICY, EXIT_USAGE};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -147,7 +139,7 @@ fn run(cli: &Cli) -> i32 {
     }
 
     let effective_ua = cfg.user_agent.clone().unwrap_or_else(|| {
-        ua::build(
+        wm_fetch::ua::build(
             &cfg.client_name,
             cfg.contact_page.as_deref(),
             cfg.contact_email.as_deref(),
@@ -184,30 +176,8 @@ fn run(cli: &Cli) -> i32 {
         return EXIT_USAGE;
     };
 
-    // Fail-closed contact gate: never send an anonymous request. This is
-    // the fix for the "fork ships the upstream author's contact" bug — a
-    // fresh fork refuses to run until the operator configures their own.
-    if cfg.user_agent.is_none() && cfg.contact_email.is_none() && cfg.contact_page.is_none() {
-        warn(
-            "no contact configured: the WMF User-Agent policy requires contact info in \
-             every User-Agent. Set contact_email/contact_page (config file, \
-             WM_FETCH_CONTACT_* env, or --contact-*), or pass --user-agent with your \
-             own registered agent. Run `wm-fetch --init` to scaffold a config.",
-        );
-        return EXIT_USAGE;
-    }
-
-    if let Some(custom) = &cfg.user_agent {
-        if !ua::has_contact_group(custom) {
-            warn(
-                "custom --user-agent carries no parenthesized contact group; the UA \
-                 policy expects one. Sending it anyway — the obligation is yours.",
-            );
-        }
-    }
-
     // maxlag injection happens on the Action API URL before fetching.
-    let injected = maxlag::inject(&url_raw, cfg.maxlag);
+    let injected = wm_fetch::maxlag::inject(&url_raw, cfg.maxlag);
     let parsed = match url::Url::parse(&injected) {
         Ok(u) => u,
         Err(e) => {
@@ -223,9 +193,15 @@ fn run(cli: &Cli) -> i32 {
         return EXIT_USAGE;
     }
 
+    // The fail-closed contact gate (and the UA construction) live in the
+    // library constructor — CLI and library consumers share one gate.
     let state_dir = config::state_dir();
-    let mut session = match Session::new(cfg, effective_ua, state_dir) {
+    let mut session = match Session::connect_with(cfg, state_dir, SessionOptions::default()) {
         Ok(s) => s,
+        Err(Fail::Config(m)) => {
+            warn(&m);
+            return EXIT_USAGE;
+        }
         Err(Fail::Fatal(m)) | Err(Fail::Budget(m)) => {
             warn(&m);
             return EXIT_FAIL;
@@ -233,6 +209,12 @@ fn run(cli: &Cli) -> i32 {
         Err(Fail::Policy(m)) => {
             warn(&m);
             return EXIT_POLICY;
+        }
+        Err(Fail::TooLarge { limit, observed }) => {
+            warn(&format!(
+                "response body exceeded the configured cap ({observed} bytes read against a {limit}-byte limit)"
+            ));
+            return EXIT_FAIL;
         }
     };
 
@@ -253,6 +235,10 @@ fn run(cli: &Cli) -> i32 {
             }
             EXIT_OK
         }
+        Err(Fail::Config(m)) => {
+            warn(&m);
+            EXIT_USAGE
+        }
         Err(Fail::Fatal(m)) | Err(Fail::Budget(m)) => {
             warn(&m);
             EXIT_FAIL
@@ -260,6 +246,12 @@ fn run(cli: &Cli) -> i32 {
         Err(Fail::Policy(m)) => {
             warn(&m);
             EXIT_POLICY
+        }
+        Err(Fail::TooLarge { limit, observed }) => {
+            warn(&format!(
+                "response body exceeded the configured cap ({observed} bytes read against a {limit}-byte limit)"
+            ));
+            EXIT_FAIL
         }
     }
 }
