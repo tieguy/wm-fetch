@@ -70,6 +70,8 @@ const WIKIMEDIA_DOMAINS: &[&str] = &[
     "toolforge.org",
     "wmcloud.org",
     "wmflabs.org",
+    // WMF-operated URL shortener.
+    "w.wiki",
 ];
 
 /// Whether a host belongs to the WMF domain family.

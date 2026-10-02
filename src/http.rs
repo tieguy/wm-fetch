@@ -166,28 +166,20 @@ pub struct Session {
     hops: Vec<Hop>,
     /// Per-fetch accumulation: robots verdict consulted for the final hop.
     robots_report: Option<RobotsReport>,
-    /// The lock bucket currently held. Wikimedia and other-Wikimedia-
-    /// services hosts share the global `state.lock`, held for the session
-    /// lifetime (pre-2.1 machine-wide serialization, unchanged). Default
-    /// hosts hold a per-host lock plus one machine-wide concurrency slot,
-    /// released at the end of a fetch.
-    lock_state: BucketLock,
+    /// The machine-wide Wikimedia lock, acquired lazily on the first
+    /// Wikimedia/other-Wikimedia-services request and held for the
+    /// session — exactly the pre-2.1 serialization. Never dropped by a
+    /// Default-host bucket (kept in its own field).
+    global_lock: Option<fs::File>,
+    /// The per-host bucket for a Default-class host, when one is active.
+    /// Released at the end of a fetch (and re-acquired for another host).
+    host_bucket: Option<HostBucket>,
 }
 
-enum BucketLock {
-    None,
-    /// Machine-wide serialization for Wikimedia hosts — exactly the
-    /// pre-2.1 behaviour. Held until the session drops.
-    Global {
-        _lock: fs::File,
-    },
-    /// Per-host serialization plus a slot in the machine-wide concurrency
-    /// pool (cap `Config::global_concurrency`). Released at fetch end.
-    Host {
-        host: String,
-        _host_lock: fs::File,
-        _slot: fs::File,
-    },
+struct HostBucket {
+    host: String,
+    _host_lock: fs::File,
+    _slot: fs::File,
 }
 
 enum RobotsFetch {
@@ -303,7 +295,8 @@ impl Session {
             options,
             hops: Vec::new(),
             robots_report: None,
-            lock_state: BucketLock::None,
+            global_lock: None,
+            host_bucket: None,
         })
     }
 
@@ -373,45 +366,54 @@ impl Session {
         };
         match host_class(&host) {
             HostClass::Wikimedia | HostClass::OtherServices => {
-                if !matches!(self.lock_state, BucketLock::Global { .. }) {
-                    self.release_host_lock();
-                    let lock = Self::acquire_exclusive(
+                if self.global_lock.is_none() {
+                    self.host_bucket = None;
+                    self.global_lock = Some(Self::acquire_exclusive(
                         &self.state_dir.join("state.lock"),
                         self.deadline,
                         "lock",
-                    )?;
-                    self.lock_state = BucketLock::Global { _lock: lock };
+                    )?);
                 }
             }
             HostClass::Default => {
-                if let BucketLock::Host { host: held, .. } = &self.lock_state {
-                    if *held == host {
+                if let Some(bucket) = &self.host_bucket {
+                    if bucket.host == host {
                         return Ok(());
                     }
                 }
-                self.release_host_lock();
+                self.host_bucket = None;
                 let slot = self.acquire_slot()?;
                 let host_lock = Self::acquire_exclusive(
                     &pacing::host_lock_file(&self.state_dir, &host),
                     self.deadline,
                     "per-host lock",
                 )?;
-                self.lock_state = BucketLock::Host {
+                self.host_bucket = Some(HostBucket {
                     host,
                     _host_lock: host_lock,
                     _slot: slot,
-                };
+                });
             }
         }
         Ok(())
     }
 
-    /// Drop a held per-host lock (the slot goes with it). The global
-    /// Wikimedia lock is never released early.
+    /// Drop a held per-host bucket (the slot goes with it). The global
+    /// Wikimedia lock is in its own field and is never released early.
     fn release_host_lock(&mut self) {
-        if matches!(self.lock_state, BucketLock::Host { .. }) {
-            self.lock_state = BucketLock::None;
+        self.host_bucket = None;
+    }
+
+    /// The full per-hop gate for one outbound request URL: the SSRF literal
+    /// check (when enabled) plus the lock bucket. Used by the target loop
+    /// and the robots.txt redirect loop alike — no request kind is exempt.
+    fn gate_hop(&mut self, url: &Url) -> Result<(), Fail> {
+        if self.options.refuse_internal_addresses && ssrf::host_is_blocked_literal(url) {
+            return Err(Fail::Policy(format!(
+                "SSRF: target {url} is a non-public IP literal"
+            )));
         }
+        self.ensure_lock(url)
     }
 
     /// The User-Agent this session sends.
@@ -648,6 +650,9 @@ impl Session {
         let mut hops = 0;
         let mut current = robots_url;
         loop {
+            // Every outbound request — including robots.txt redirect hops,
+            // which can cross hosts — goes through the same per-hop gate.
+            self.gate_hop(&current)?;
             let resp = match self.send_once(&current) {
                 Ok(r) => r,
                 // Transport errors while fetching robots.txt → fail-closed
@@ -761,13 +766,7 @@ impl Session {
         let mut hops = 0;
         let mut current = url.clone();
         loop {
-            if self.options.refuse_internal_addresses && ssrf::host_is_blocked_literal(&current) {
-                return Err(Fail::Policy(format!(
-                    "SSRF: target {} is a non-public IP literal",
-                    current
-                )));
-            }
-            self.ensure_lock(&current)?;
+            self.gate_hop(&current)?;
             self.policy_gate(&current)?;
             let resp = self.send_once(&current)?;
             let status = resp.status().as_u16();
