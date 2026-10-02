@@ -166,10 +166,28 @@ pub struct Session {
     hops: Vec<Hop>,
     /// Per-fetch accumulation: robots verdict consulted for the final hop.
     robots_report: Option<RobotsReport>,
-    /// Held for the whole invocation ⇒ concurrent wm-fetch processes
-    /// serialize (Robot policy: concurrency 1). Blocking bounded by the
-    /// --max-time budget.
-    _lock: fs::File,
+    /// The lock bucket currently held. Wikimedia and other-Wikimedia-
+    /// services hosts share the global `state.lock`, held for the session
+    /// lifetime (pre-2.1 machine-wide serialization, unchanged). Default
+    /// hosts hold a per-host lock plus one machine-wide concurrency slot,
+    /// released at the end of a fetch.
+    lock_state: BucketLock,
+}
+
+enum BucketLock {
+    None,
+    /// Machine-wide serialization for Wikimedia hosts — exactly the
+    /// pre-2.1 behaviour. Held until the session drops.
+    Global {
+        _lock: fs::File,
+    },
+    /// Per-host serialization plus a slot in the machine-wide concurrency
+    /// pool (cap `Config::global_concurrency`). Released at fetch end.
+    Host {
+        host: String,
+        _host_lock: fs::File,
+        _slot: fs::File,
+    },
 }
 
 enum RobotsFetch {
@@ -268,27 +286,12 @@ impl Session {
 
         let deadline = Instant::now() + Duration::from_secs_f64(cfg.max_time_secs.max(0.1));
 
+        // The lock is acquired lazily, per bucket, at fetch time: Wikimedia
+        // hosts serialize machine-wide via the global state.lock (held for
+        // the session); Default hosts take a per-host lock plus a
+        // concurrency-pool slot.
         fs::create_dir_all(&state_dir)
             .map_err(|e| Fail::Fatal(format!("creating state dir {}: {e}", state_dir.display())))?;
-        let lock_path = state_dir.join("state.lock");
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|e| Fail::Fatal(format!("opening {}: {e}", lock_path.display())))?;
-        use fs4::fs_std::FileExt;
-        loop {
-            if matches!(lock.try_lock_exclusive(), Ok(true)) {
-                break;
-            }
-            if Instant::now() >= deadline {
-                return Err(Fail::Budget(
-                    "lock wait would exceed --max-time (another wm-fetch is running)".to_string(),
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
 
         Ok(Self {
             cfg,
@@ -300,8 +303,115 @@ impl Session {
             options,
             hops: Vec::new(),
             robots_report: None,
-            _lock: lock,
+            lock_state: BucketLock::None,
         })
+    }
+
+    /// Wait for an exclusive lock on `path` until the deadline.
+    fn acquire_exclusive(path: &PathBuf, deadline: Instant, what: &str) -> Result<fs::File, Fail> {
+        use fs4::fs_std::FileExt;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| Fail::Fatal(format!("creating {}: {e}", parent.display())))?;
+        }
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .map_err(|e| Fail::Fatal(format!("opening {}: {e}", path.display())))?;
+        loop {
+            if matches!(lock.try_lock_exclusive(), Ok(true)) {
+                return Ok(lock);
+            }
+            if Instant::now() >= deadline {
+                return Err(Fail::Budget(format!(
+                    "{what} wait would exceed --max-time (another wm-fetch is running)"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Take one slot from the machine-wide concurrency pool (Default hosts
+    /// only). Slots are scanned in a fixed order so there is no
+    /// lock-ordering cycle; waits are bounded by the budget.
+    fn acquire_slot(&self) -> Result<fs::File, Fail> {
+        use fs4::fs_std::FileExt;
+        let cap = self.cfg.global_concurrency.max(1);
+        loop {
+            for i in 0..cap {
+                let path = pacing::slot_file(&self.state_dir, i);
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if let Ok(f) = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&path)
+                {
+                    if matches!(f.try_lock_exclusive(), Ok(true)) {
+                        return Ok(f);
+                    }
+                }
+            }
+            if Instant::now() >= self.deadline {
+                return Err(Fail::Budget(
+                    "concurrency-slot wait would exceed --max-time (all global slots busy)"
+                        .to_string(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Acquire the right lock bucket for a request to `url`'s host.
+    fn ensure_lock(&mut self, url: &Url) -> Result<(), Fail> {
+        let Some(host) = url.host_str().map(str::to_string) else {
+            return Err(Fail::Fatal("URL has no host".into()));
+        };
+        match host_class(&host) {
+            HostClass::Wikimedia | HostClass::OtherServices => {
+                if !matches!(self.lock_state, BucketLock::Global { .. }) {
+                    self.release_host_lock();
+                    let lock = Self::acquire_exclusive(
+                        &self.state_dir.join("state.lock"),
+                        self.deadline,
+                        "lock",
+                    )?;
+                    self.lock_state = BucketLock::Global { _lock: lock };
+                }
+            }
+            HostClass::Default => {
+                if let BucketLock::Host { host: held, .. } = &self.lock_state {
+                    if *held == host {
+                        return Ok(());
+                    }
+                }
+                self.release_host_lock();
+                let slot = self.acquire_slot()?;
+                let host_lock = Self::acquire_exclusive(
+                    &pacing::host_lock_file(&self.state_dir, &host),
+                    self.deadline,
+                    "per-host lock",
+                )?;
+                self.lock_state = BucketLock::Host {
+                    host,
+                    _host_lock: host_lock,
+                    _slot: slot,
+                };
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop a held per-host lock (the slot goes with it). The global
+    /// Wikimedia lock is never released early.
+    fn release_host_lock(&mut self) {
+        if matches!(self.lock_state, BucketLock::Host { .. }) {
+            self.lock_state = BucketLock::None;
+        }
     }
 
     /// The User-Agent this session sends.
@@ -331,7 +441,8 @@ impl Session {
         };
         let class = host_class(host);
         let crawl_delay = self.crawl_delays.get(host);
-        let state = pacing::load_state(&self.state_dir);
+        let state_file = pacing::state_file_for(&self.state_dir, host);
+        let state = pacing::load_state_file(&state_file);
         let wait_ms = pacing::required_wait_ms(&state, pacing::now_ms(), class, crawl_delay);
         if wait_ms == 0 {
             return Ok(());
@@ -347,7 +458,8 @@ impl Session {
                 (false, HostClass::OtherServices) => {
                     "≥1s between requests to this service per Robot policy"
                 }
-                (false, HostClass::Default) => "pacing per Robot policy",
+                (false, HostClass::Default) => "≥1s per-host pacing floor",
+                (false, HostClass::Wikimedia) => "pacing per Robot policy",
             };
             eprintln!(
                 "wm-fetch: pacing: waiting {:.1}s ({why})",
@@ -372,7 +484,9 @@ impl Session {
             .header(reqwest::header::USER_AGENT, &self.ua)
             .timeout(remaining)
             .send();
-        pacing::record_request(&self.state_dir, t0);
+        let state_file =
+            pacing::state_file_for(&self.state_dir, url.host_str().unwrap_or_default());
+        pacing::record_request_file(&state_file, t0);
         match resp {
             Ok(r) => Ok(r),
             Err(e) => {
@@ -631,6 +745,14 @@ impl Session {
     /// manual redirects → maxlag sniff. Returns the final response for
     /// output handling by the caller.
     pub fn fetch(&mut self, url: &Url) -> Result<Final, Fail> {
+        let result = self.fetch_inner(url);
+        // A per-host lock (and its concurrency slot) is released at the end
+        // of a fetch; the global Wikimedia lock is held for the session.
+        self.release_host_lock();
+        result
+    }
+
+    fn fetch_inner(&mut self, url: &Url) -> Result<Final, Fail> {
         self.hops.clear();
         self.robots_report = None;
         // `--retries N` means N retries: N+1 total attempts (>= 1).
@@ -645,6 +767,7 @@ impl Session {
                     current
                 )));
             }
+            self.ensure_lock(&current)?;
             self.policy_gate(&current)?;
             let resp = self.send_once(&current)?;
             let status = resp.status().as_u16();

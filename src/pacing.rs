@@ -1,12 +1,21 @@
 //! Cross-invocation pacing (Wikitech Robot policy) and the other-services
 //! cooldown. Policy-derived floors are constants — never configurable.
 //!
-//! Floors (strictest applicable subset, applied globally):
-//! - Default hosts: ≥250ms between request ends (≤4 req/s, strictly
+//! Floors (strictest applicable subset):
+//! - Wikimedia hosts: ≥250ms between request ends (≤4 req/s, strictly
 //!   "below 5 req/s"), ≥5000ms after a request that took >1s to serve
-//!   (Action API slow-pause rule).
+//!   (Action API slow-pause rule). Machine-wide serialization: one
+//!   process may touch Wikimedia hosts at a time (global state.lock),
+//!   pacing recorded in the global state.json — exactly as before 2.1.
 //! - Other-services (gerrit/gitlab/phabricator/lists): ≥1000ms between
-//!   request ends, and a 15-minute pause after any 5xx from that host.
+//!   request ends, a 15-minute pause after any 5xx from that host, same
+//!   global lock bucket.
+//! - Other hosts: a per-host lock and per-host state file
+//!   (hosts/<host>.json) with a ≥1000ms per-host floor; crawl-delay still
+//!   raises it, and the slow-pause rule still applies per host. Machine-
+//!   wide concurrency across different hosts is capped by the slot pool
+//!   (config `global_concurrency`, default 8) — parallelism spreads across
+//!   hosts, never within one.
 //! - robots.txt Crawl-delay, when declared: effective floor is
 //!   max(crawl-delay, host floor).
 
@@ -18,12 +27,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::classify::HostClass;
 
-pub const DEFAULT_FLOOR_MS: u64 = 250;
+pub const WIKIMEDIA_FLOOR_MS: u64 = 250;
 pub const OTHER_SERVICES_FLOOR_MS: u64 = 1000;
+pub const PER_HOST_FLOOR_MS: u64 = 1000;
 pub const EXPENSIVE_THRESHOLD_MS: u64 = 1000;
 pub const EXPENSIVE_PAUSE_MS: u64 = 5000;
 pub const COOLDOWN_MS: u64 = 15 * 60 * 1000;
 pub const ROBOTS_CACHE_TTL_MS: u64 = 60 * 60 * 1000;
+pub const DEFAULT_GLOBAL_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RequestState {
@@ -51,8 +62,9 @@ pub fn required_wait_ms(
         return 0;
     };
     let mut gap = match class {
+        HostClass::Wikimedia => WIKIMEDIA_FLOOR_MS,
         HostClass::OtherServices => OTHER_SERVICES_FLOOR_MS,
-        HostClass::Default => DEFAULT_FLOOR_MS,
+        HostClass::Default => PER_HOST_FLOOR_MS,
     };
     if let Some(cd) = crawl_delay_ms {
         gap = gap.max(cd);
@@ -67,6 +79,31 @@ pub fn state_path(dir: &Path) -> PathBuf {
     dir.join("state.json")
 }
 
+/// Filename-safe host key (IPv6 colons become dashes).
+pub fn host_key(host: &str) -> String {
+    host.trim_end_matches('.')
+        .to_ascii_lowercase()
+        .replace(':', "-")
+}
+
+/// The pacing state file governing requests to `host`.
+pub fn state_file_for(dir: &Path, host: &str) -> PathBuf {
+    match crate::classify::host_class(host) {
+        HostClass::Wikimedia | HostClass::OtherServices => state_path(dir),
+        HostClass::Default => dir.join("hosts").join(format!("{}.json", host_key(host))),
+    }
+}
+
+/// The per-host lock file for a Default-class host.
+pub fn host_lock_file(dir: &Path, host: &str) -> PathBuf {
+    dir.join("hosts").join(format!("{}.lock", host_key(host)))
+}
+
+/// Slot file `i` of the machine-wide concurrency pool for Default hosts.
+pub fn slot_file(dir: &Path, i: usize) -> PathBuf {
+    dir.join("slots").join(format!("slot-{i}.lock"))
+}
+
 /// Corrupt or missing state reads as "no previous request" — pacing simply
 /// doesn't fire. Recorded state is an optimization for politeness, not a
 /// correctness gate.
@@ -77,19 +114,44 @@ pub fn load_state(dir: &Path) -> RequestState {
         .unwrap_or_default()
 }
 
+/// Load pacing state from an explicit state *file* (global or per-host).
+pub fn load_state_file(file: &Path) -> RequestState {
+    fs::read_to_string(file)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
 /// Record one completed outbound request (any kind — target, robots.txt,
-/// redirect hop): its end time and how long it took to serve.
+/// redirect hop): its end time and how long it took to serve. Writes are
+/// concurrency-safe (tmp + rename) and serialized by the governing lock.
 pub fn record_request(dir: &Path, started: Instant) {
     let duration_ms = started.elapsed().as_millis() as u64;
     let st = RequestState {
         last_request_end_ms: Some(now_ms()),
         last_request_duration_ms: Some(duration_ms),
     };
-    let _ = fs::create_dir_all(dir);
-    if let Ok(json) = serde_json::to_string(&st) {
-        let tmp = state_path(dir).with_extension("json.tmp");
+    write_state_file(&state_path(dir), &st);
+}
+
+/// Record into an explicit state *file* (global or per-host).
+pub fn record_request_file(file: &Path, started: Instant) {
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let st = RequestState {
+        last_request_end_ms: Some(now_ms()),
+        last_request_duration_ms: Some(duration_ms),
+    };
+    write_state_file(file, &st);
+}
+
+fn write_state_file(file: &Path, st: &RequestState) {
+    if let Some(parent) = file.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string(st) {
+        let tmp = file.with_extension("json.tmp");
         if fs::write(&tmp, json).is_ok() {
-            let _ = fs::rename(&tmp, state_path(dir));
+            let _ = fs::rename(&tmp, file);
         }
     }
 }
@@ -150,19 +212,24 @@ mod tests {
 
     #[test]
     fn pacer_math_basic_floor() {
-        // Default class, cheap previous request, 100ms elapsed → wait 150ms.
+        // Wikimedia class, cheap previous request, 100ms elapsed → wait 150ms.
         assert_eq!(
-            required_wait_ms(&st(1000, 100), 1100, HostClass::Default, None),
+            required_wait_ms(&st(1000, 100), 1100, HostClass::Wikimedia, None),
             150
         );
         // Fully elapsed → no wait.
         assert_eq!(
-            required_wait_ms(&st(1000, 100), 1300, HostClass::Default, None),
+            required_wait_ms(&st(1000, 100), 1300, HostClass::Wikimedia, None),
             0
+        );
+        // Default (non-Wikimedia) class: 1000ms per-host floor.
+        assert_eq!(
+            required_wait_ms(&st(1000, 100), 1100, HostClass::Default, None),
+            900
         );
         // No previous request → no wait.
         assert_eq!(
-            required_wait_ms(&RequestState::default(), 0, HostClass::Default, None),
+            required_wait_ms(&RequestState::default(), 0, HostClass::Wikimedia, None),
             0
         );
     }
@@ -171,18 +238,23 @@ mod tests {
     fn pacer_math_expensive_pause() {
         // Previous request took >1s → 5s gap required.
         assert_eq!(
-            required_wait_ms(&st(1000, 1500), 2000, HostClass::Default, None),
+            required_wait_ms(&st(1000, 1500), 2000, HostClass::Wikimedia, None),
             4000
         );
         // Exactly at the 5s boundary → 0.
         assert_eq!(
-            required_wait_ms(&st(1000, 1500), 6000, HostClass::Default, None),
+            required_wait_ms(&st(1000, 1500), 6000, HostClass::Wikimedia, None),
             0
         );
         // 1000ms duration is NOT >1000ms → normal floor applies.
         assert_eq!(
-            required_wait_ms(&st(1000, 1000), 1100, HostClass::Default, None),
+            required_wait_ms(&st(1000, 1000), 1100, HostClass::Wikimedia, None),
             150
+        );
+        // The expensive pause applies to Default hosts too.
+        assert_eq!(
+            required_wait_ms(&st(1000, 1500), 2000, HostClass::Default, None),
+            4000
         );
     }
 
@@ -198,17 +270,17 @@ mod tests {
     fn pacer_math_crawl_delay_vs_floor() {
         // Crawl-delay larger than floor wins.
         assert_eq!(
-            required_wait_ms(&st(1000, 100), 1100, HostClass::Default, Some(2000)),
+            required_wait_ms(&st(1000, 100), 1100, HostClass::Wikimedia, Some(2000)),
             1900
         );
         // Smaller than floor loses.
         assert_eq!(
-            required_wait_ms(&st(1000, 100), 1100, HostClass::Default, Some(100)),
+            required_wait_ms(&st(1000, 100), 1100, HostClass::Wikimedia, Some(100)),
             150
         );
         // But never shrinks the post-expensive pause.
         assert_eq!(
-            required_wait_ms(&st(1000, 1500), 2000, HostClass::Default, Some(100)),
+            required_wait_ms(&st(1000, 1500), 2000, HostClass::Wikimedia, Some(100)),
             4000
         );
     }

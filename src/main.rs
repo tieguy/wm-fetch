@@ -68,6 +68,11 @@ struct Cli {
     #[arg(long, value_name = "N")]
     max_redirs: Option<usize>,
 
+    /// Machine-wide concurrency cap for non-Wikimedia hosts (default 8).
+    /// Wikimedia hosts stay machine-wide serialized regardless.
+    #[arg(long, value_name = "N")]
+    global_concurrency: Option<usize>,
+
     /// Retry attempts for 429/503/maxlag (0 = one attempt, no retries)
     #[arg(long)]
     retries: Option<usize>,
@@ -100,6 +105,7 @@ fn overrides_from(cli: &Cli) -> CliOverrides {
         max_time: cli.max_time,
         connect_timeout: cli.connect_timeout,
         max_redirs: cli.max_redirs,
+        global_concurrency: cli.global_concurrency,
     }
 }
 
@@ -162,6 +168,7 @@ fn run(cli: &Cli) -> i32 {
         println!("max_time         = {}s", cfg.max_time_secs);
         println!("connect_timeout  = {}s", cfg.connect_timeout_secs);
         println!("max_redirs       = {}", cfg.max_redirs);
+        println!("global_concurrency = {}", cfg.global_concurrency);
         if cfg.user_agent.is_none() && cfg.contact_email.is_none() && cfg.contact_page.is_none() {
             println!(
                 "status           = REFUSES TO FETCH: no contact configured \

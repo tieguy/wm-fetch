@@ -36,12 +36,57 @@ pub fn is_api_exempt(url: &Url) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostClass {
-    /// Wiki content/API hosts and all non-Wikimedia hosts: ≥250ms floor.
-    Default,
+    /// Wikimedia project hosts (wikipedia.org, wikidata.org, …): the
+    /// machine-wide serialization and global pacing state apply unchanged.
+    Wikimedia,
     /// gerrit/gitlab/phabricator/lists under *.wikimedia.org:
     /// ≥1s floor and a 15-minute pause after any 5xx (Wikitech Robot policy,
-    /// "other wikimedia.org services" row).
+    /// "other wikimedia.org services" row). Same lock bucket as
+    /// Wikimedia.
     OtherServices,
+    /// Everything else: per-host lock and per-host pacing state; the
+    /// machine-wide concurrency is capped by the slot pool.
+    Default,
+}
+
+/// The WMF domain family. Suffix matching is label-anchored
+/// (`en.wikipedia.org` matches; `notwikipedia.org` does not). Over-broad
+/// is the safe direction: a host kept in the global bucket merely stays
+/// machine-wide serialized, exactly as before 2.1.
+const WIKIMEDIA_DOMAINS: &[&str] = &[
+    "wikipedia.org",
+    "wikimedia.org",
+    "wikidata.org",
+    "wikibooks.org",
+    "wiktionary.org",
+    "wikiquote.org",
+    "wikisource.org",
+    "wikinews.org",
+    "wikiversity.org",
+    "wikivoyage.org",
+    "mediawiki.org",
+    "wikifunctions.org",
+    "wikimediafoundation.org",
+    "toolforge.org",
+    "wmcloud.org",
+    "wmflabs.org",
+];
+
+/// Whether a host belongs to the WMF domain family.
+#[must_use]
+pub fn is_wikimedia_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    WIKIMEDIA_DOMAINS
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+}
+
+/// Test-only tighten override: when `WM_FETCH_WMF_TEST_FORCE_WIKIMEDIA=1`,
+/// every host classifies as Wikimedia, so offline loopback tests exercise
+/// the global-lock bucket. Tighten-only — there is no override in the
+/// relaxing direction, so it cannot weaken compliance.
+fn forced_wikimedia() -> bool {
+    std::env::var("WM_FETCH_WMF_TEST_FORCE_WIKIMEDIA").as_deref() == Ok("1")
 }
 
 /// Any 5xx from an other-services host arms the 15-minute cooldown (and is
@@ -61,10 +106,12 @@ pub fn host_class(host: &str) -> HostClass {
         && labels[1] == "wikimedia"
         && labels[2] == "org"
     {
-        HostClass::OtherServices
-    } else {
-        HostClass::Default
+        return HostClass::OtherServices;
     }
+    if forced_wikimedia() || is_wikimedia_host(&host) {
+        return HostClass::Wikimedia;
+    }
+    HostClass::Default
 }
 
 #[cfg(test)]
@@ -139,12 +186,19 @@ mod tests {
             "en.wikipedia.org",
             "meta.wikimedia.org",
             "www.mediawiki.org",
+            "www.wikidata.org",
+            "en.wiktionary.org",
+            "citation-fetcher.toolforge.org",
+        ] {
+            assert_eq!(host_class(h), HostClass::Wikimedia, "{h}");
+        }
+        for h in [
             "example.org",
             "lists.example.org",
             "gerrit.example.com",
-            "mygerrit.wikimedia.org",
-            "wikimedia.org",
-            "gerrit.wikimedia.org.example.net",
+            "wikimedia.org.example.net",
+            "notwikipedia.org",
+            "web.archive.org",
         ] {
             assert_eq!(host_class(h), HostClass::Default, "{h}");
         }
@@ -153,6 +207,15 @@ mod tests {
             host_class("GERRIT.Wikimedia.org."),
             HostClass::OtherServices
         );
+        assert_eq!(host_class("EN.Wikipedia.org."), HostClass::Wikimedia);
+    }
+
+    #[test]
+    fn wikimedia_domain_family() {
+        assert!(is_wikimedia_host("wikipedia.org"));
+        assert!(is_wikimedia_host("de.wikipedia.org"));
+        assert!(!is_wikimedia_host("wikipedia.org.evil.net"));
+        assert!(!is_wikimedia_host("wikipedia.example.org"));
     }
 
     #[test]

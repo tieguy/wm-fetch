@@ -544,12 +544,15 @@ async fn pacing_wait_aborts_under_max_time() {
 
     let dir = tempfile::tempdir().unwrap();
     // Pre-seed: previous request took >1s → next must wait ≥5s…
+    // (2.1: non-Wikimedia hosts pace from the per-host state file.)
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
+    let hosts_dir = dir.path().join("hosts");
+    std::fs::create_dir_all(&hosts_dir).unwrap();
     std::fs::write(
-        dir.path().join("state.json"),
+        hosts_dir.join("127.0.0.1.json"),
         format!(r#"{{"last_request_end_ms":{now},"last_request_duration_ms":2000}}"#),
     )
     .unwrap();
@@ -796,8 +799,11 @@ async fn pacing_after_expensive() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
+    // (2.1: non-Wikimedia hosts pace from the per-host state file.)
+    let hosts_dir = dir.path().join("hosts");
+    std::fs::create_dir_all(&hosts_dir).unwrap();
     std::fs::write(
-        dir.path().join("state.json"),
+        hosts_dir.join("127.0.0.1.json"),
         format!(r#"{{"last_request_end_ms":{now},"last_request_duration_ms":1200}}"#),
     )
     .unwrap();
@@ -952,6 +958,136 @@ async fn robots_first_call_paced() {
     assert_eq!(arrivals.len(), 2, "robots + target");
     let gap = arrivals[1].duration_since(arrivals[0]);
     assert!(gap >= Duration::from_millis(240), "gap was {gap:?}");
+}
+
+// ------------------------------------------------- per-host concurrency ---
+// 2.1: non-Wikimedia hosts get per-host locks and per-host pacing state;
+// Wikimedia hosts keep machine-wide serialization. Process-based, since
+// in-process sessions would share file locks and pass vacuously.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn per_host_concurrency_processes() {
+    // Two distinct hosts (localhost vs 127.0.0.1 — distinct host strings),
+    // each with a 400ms API response. Two processes in parallel must
+    // complete in less than the serialized lower bound (~1050ms under the
+    // pre-2.1 global lock + 250ms floor).
+    let (_srv1, port1) = RawServer::spawn(
+        vec![("/w/api.php".to_string(), r#"{"ok":1}"#.to_string())],
+        400,
+    );
+    let (_srv2, port2) = RawServer::spawn(
+        vec![("/w/api.php".to_string(), r#"{"ok":2}"#.to_string())],
+        400,
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut handles = Vec::new();
+    for (host, port) in [("localhost", port1), ("127.0.0.1", port2)] {
+        let d = dir.path().to_path_buf();
+        handles.push(std::thread::spawn(move || {
+            run(isolated(&d)
+                .arg(format!("http://{host}:{port}/w/api.php?x=1"))
+                .arg("--contact-email")
+                .arg("t@example.org")
+                .arg("--max-time")
+                .arg("30"))
+        }));
+    }
+    let t0 = Instant::now();
+    for h in handles {
+        let out = h.join().unwrap();
+        assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    }
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "different hosts must run concurrently, took {elapsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_host_stays_serialized_processes() {
+    // Same host, two processes: the per-host lock plus the 1000ms per-host
+    // pacing floor keep arrivals apart.
+    let (srv, port) = RawServer::spawn(
+        vec![("/w/api.php".to_string(), r#"{"ok":1}"#.to_string())],
+        400,
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let d = dir.path().to_path_buf();
+        handles.push(std::thread::spawn(move || {
+            run(isolated(&d)
+                .arg(format!("http://127.0.0.1:{port}/w/api.php?x=1"))
+                .arg("--contact-email")
+                .arg("t@example.org")
+                .arg("--max-time")
+                .arg("30"))
+        }));
+    }
+    for h in handles {
+        let out = h.join().unwrap();
+        assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    }
+
+    let arrivals = srv.arrivals.lock().unwrap().clone();
+    assert_eq!(arrivals.len(), 2, "both processes reached the server");
+    assert!(
+        arrivals[1].duration_since(arrivals[0]) >= Duration::from_millis(380),
+        "same-host arrivals were {arrivals:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wikimedia_hosts_stay_serialized() {
+    // With the tighten-only test override, loopback hosts classify as
+    // Wikimedia and share the machine-wide state.lock: a second process
+    // times out against the lock while the first retains it.
+    let (_srv_a, port_a) = RawServer::spawn(
+        vec![("/w/api.php".to_string(), r#"{"ok":1}"#.to_string())],
+        1500,
+    );
+    let (_srv_b, port_b) = RawServer::spawn(
+        vec![("/w/api.php".to_string(), r#"{"ok":2}"#.to_string())],
+        0,
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let d1 = dir.path().to_path_buf();
+    let a = std::thread::spawn(move || {
+        let mut c = isolated(&d1);
+        c.arg(format!("http://127.0.0.1:{port_a}/w/api.php?x=1"))
+            .arg("--contact-email")
+            .arg("t@example.org")
+            .arg("--max-time")
+            .arg("30")
+            .env("WM_FETCH_WMF_TEST_FORCE_WIKIMEDIA", "1");
+        run(&mut c)
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    let d2 = dir.path().to_path_buf();
+    let b = std::thread::spawn(move || {
+        let mut c = isolated(&d2);
+        c.arg(format!("http://127.0.0.1:{port_b}/w/api.php?x=1"))
+            .arg("--contact-email")
+            .arg("t@example.org")
+            .arg("--max-time")
+            .arg("0.5")
+            .env("WM_FETCH_WMF_TEST_FORCE_WIKIMEDIA", "1");
+        run(&mut c)
+    });
+
+    let out_a = a.join().unwrap();
+    assert_eq!(code(&out_a), 0, "stderr: {}", stderr(&out_a));
+    let out_b = b.join().unwrap();
+    assert_eq!(code(&out_b), 1, "second process must time out on the lock");
+    assert!(
+        stderr(&out_b).contains("lock wait would exceed --max-time"),
+        "stderr: {}",
+        stderr(&out_b)
+    );
 }
 
 // --------------------------------------------------------------- AC.11 ---

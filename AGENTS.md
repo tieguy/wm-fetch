@@ -34,9 +34,17 @@ cargo fmt && cargo clippy --all-targets -- -D warnings   # CI enforces both
   paths honored, fail-closed on fetch failure) is a documented design
   decision, not an oversight. See README "robots.txt, and the
   API-endpoint question".
-- Every outbound HTTP request must go through the pacer + lock +
-  state.json machinery (`Session::send_once`). No request kind is exempt
-  — that includes robots.txt fetches and redirect hops.
+- Every outbound HTTP request must go through the pacer + lock + state
+  machinery (`Session::send_once`). No request kind is exempt — that
+  includes robots.txt fetches and redirect hops. Since the 2.1 pacing
+  change there are two buckets: **Wikimedia and other-Wikimedia-services
+  hosts** share the machine-wide `state.lock` and the global `state.json`
+  (bit-for-bit the old behaviour); **all other hosts** get a per-host lock
+  and per-host state file (`hosts/<host>.json`) with a ≥1s floor, and
+  machine-wide concurrency across different hosts capped by the slot pool
+  (`global_concurrency`, default 8). `WM_FETCH_WMF_TEST_FORCE_WIKIMEDIA=1`
+  is a test-only tighten override (everything classifies Wikimedia); there
+  is no override in the relaxing direction.
 - Exit codes: 0 ok; 1 transport/HTTP≥400/budget abort; 2 usage/config;
   3 policy refusal (three kinds — robots disallow, robots unreachable,
   other-services cooldown). `--help` must keep enumerating them

@@ -27,6 +27,9 @@ pub struct Config {
     pub max_time_secs: f64,
     pub connect_timeout_secs: f64,
     pub max_redirs: usize,
+    /// Machine-wide concurrency cap for non-Wikimedia hosts (the slot-pool
+    /// size). Wikimedia hosts stay machine-wide serialized regardless.
+    pub global_concurrency: usize,
 }
 
 impl Default for Config {
@@ -41,6 +44,7 @@ impl Default for Config {
             max_time_secs: DEFAULT_MAX_TIME,
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT,
             max_redirs: DEFAULT_MAX_REDIRS,
+            global_concurrency: crate::pacing::DEFAULT_GLOBAL_CONCURRENCY,
         }
     }
 }
@@ -56,6 +60,7 @@ struct FileConfig {
     max_time: Option<f64>,
     connect_timeout: Option<f64>,
     max_redirs: Option<usize>,
+    global_concurrency: Option<usize>,
 }
 
 /// CLI overrides (all optional; highest precedence).
@@ -70,6 +75,7 @@ pub struct CliOverrides {
     pub max_time: Option<f64>,
     pub connect_timeout: Option<f64>,
     pub max_redirs: Option<usize>,
+    pub global_concurrency: Option<usize>,
 }
 
 pub fn config_path() -> PathBuf {
@@ -117,6 +123,7 @@ pub fn load_from(path: &Path, env: &[(String, String)], cli: &CliOverrides) -> R
         cfg.max_time_secs = f.max_time.unwrap_or(cfg.max_time_secs);
         cfg.connect_timeout_secs = f.connect_timeout.unwrap_or(cfg.connect_timeout_secs);
         cfg.max_redirs = f.max_redirs.unwrap_or(cfg.max_redirs);
+        cfg.global_concurrency = f.global_concurrency.unwrap_or(cfg.global_concurrency);
     }
 
     let get = |k: &str| -> Option<String> {
@@ -153,6 +160,9 @@ pub fn load_from(path: &Path, env: &[(String, String)], cli: &CliOverrides) -> R
         cfg.connect_timeout_secs = n
     })?;
     env_num("WM_FETCH_MAX_REDIRS", &mut |n| cfg.max_redirs = n as usize)?;
+    env_num("WM_FETCH_GLOBAL_CONCURRENCY", &mut |n| {
+        cfg.global_concurrency = n as usize
+    })?;
 
     let CliOverrides {
         client_name,
@@ -164,6 +174,7 @@ pub fn load_from(path: &Path, env: &[(String, String)], cli: &CliOverrides) -> R
         max_time,
         connect_timeout,
         max_redirs,
+        global_concurrency,
     } = cli;
     if let Some(v) = client_name {
         cfg.client_name = v.clone();
@@ -191,6 +202,9 @@ pub fn load_from(path: &Path, env: &[(String, String)], cli: &CliOverrides) -> R
     }
     if let Some(v) = max_redirs {
         cfg.max_redirs = *v;
+    }
+    if let Some(v) = global_concurrency {
+        cfg.global_concurrency = (*v).max(1);
     }
 
     // Empty/whitespace contact strings mean "unset" at every layer (the env
@@ -224,6 +238,9 @@ pub const INIT_TEMPLATE: &str = r##"# wm-fetch configuration.
 #connect_timeout = 10
 #max_redirs = 3
 #maxlag = 5
+# Machine-wide concurrency cap for non-Wikimedia hosts (Wikimedia hosts stay
+# machine-wide serialized regardless). Compliance floors are not configurable.
+#global_concurrency = 8
 "##;
 
 #[cfg(test)]
