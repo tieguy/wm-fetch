@@ -171,7 +171,11 @@ fn rule_matches(pattern: &str, target: &str) -> bool {
             t += 1;
             continue;
         }
-        if star != usize::MAX {
+        // Backtrack: let the last `*` absorb one more character — only
+        // while characters remain. Without the bound, a wildcard pattern
+        // that does not match walks `mark` past the end of the target and
+        // loops forever.
+        if star != usize::MAX && mark < text.len() {
             p = star + 1;
             mark += 1;
             t = mark;
@@ -356,6 +360,62 @@ mod tests {
         assert!(rule_matches("/*/x", "/a/b/x"));
         assert!(rule_matches("/foo$", "/foo"));
         assert!(!rule_matches("/foo$", "/foobar"));
+    }
+
+    /// Wildcard patterns that do NOT match must return false promptly
+    /// (they used to loop forever). Rules from a real WordPress
+    /// robots.txt (bernews.com) against one of its article paths. Run on
+    /// a thread with a deadline so a regression fails instead of hanging
+    /// the suite.
+    #[test]
+    fn non_matching_wildcards_terminate() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use super::rule_matches;
+            let target = "/2025/08/aug15-kalen-brunson-makes-qpr-debut-cup/";
+            let results = [
+                rule_matches("/*trackback/", target),
+                rule_matches("/2*feed/", target),
+                rule_matches("/*?s", target),
+                rule_matches("/*.pdf$", target),
+                rule_matches("*x", ""),
+                rule_matches("/a*b", "/a"),
+                // Wildcards that do match, including with `$` anchors.
+                rule_matches("/*cup/", target),
+                rule_matches("/a*$", "/a"),
+                rule_matches("/a*$", "/abc"),
+                rule_matches("/*.pdf$", "/x/y.pdf"),
+                rule_matches("/*.pdf$", "/x.pdf.pdf"),
+            ];
+            let _ = tx.send(results);
+        });
+        let results = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("rule_matches must terminate on non-matching wildcards");
+        assert_eq!(
+            results,
+            [false, false, false, false, false, false, true, true, true, true, true]
+        );
+    }
+
+    #[test]
+    fn evaluate_terminates_on_wordpress_wildcards() {
+        let body = "User-agent: *\nDisallow: /wp-admin/\nDisallow: /*?replytocom\n\
+                    Disallow: /*trackback/\nDisallow: /2*feed/\nDisallow: /*?s\n\
+                    Crawl-delay: 3\n";
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let target = Url::parse("https://example.org/2025/08/some-article/").unwrap();
+            let _ = tx.send((
+                evaluate(body, "citation-fetcher", &target),
+                matched_rules(body, "citation-fetcher", &target),
+            ));
+        });
+        let (verdict, rules) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("evaluate must terminate");
+        assert_eq!(verdict, Verdict::Allowed);
+        assert!(rules.is_empty(), "{rules:?}");
     }
 
     #[test]
