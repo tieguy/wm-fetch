@@ -1066,7 +1066,7 @@ async fn wikimedia_hosts_stay_serialized() {
             .env("WM_FETCH_WMF_TEST_FORCE_WIKIMEDIA", "1");
         run(&mut c)
     });
-    std::thread::sleep(Duration::from_millis(150));
+    tokio::time::sleep(Duration::from_millis(150)).await;
     let d2 = dir.path().to_path_buf();
     let b = std::thread::spawn(move || {
         let mut c = isolated(&d2);

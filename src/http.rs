@@ -154,6 +154,16 @@ fn format_error_chain(e: &dyn std::error::Error) -> String {
     msg
 }
 
+/// What the manual-redirect check decided about one response.
+enum Redirect {
+    /// Not a redirect: fall through to retry/maxlag handling.
+    None,
+    /// Follow this URL on the next loop iteration.
+    Follow(Url),
+    /// A 3xx without a parseable Location: a terminal failure.
+    DeadEnd,
+}
+
 pub struct Session {
     cfg: Config,
     ua: String,
@@ -775,79 +785,31 @@ impl Session {
 
             // Manual redirect following: every hop is re-classified,
             // robots-checked, paced, and state-recorded.
-            if (300..400).contains(&status) {
-                let loc = resp_headers
-                    .get(reqwest::header::LOCATION)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
-                match loc.and_then(|l| current.join(&l).ok()) {
-                    Some(next) => {
-                        hops += 1;
-                        if hops > self.cfg.max_redirs {
-                            return Err(Fail::Fatal(format!(
-                                "too many redirects (limit {})",
-                                self.cfg.max_redirs
-                            )));
-                        }
-                        // Action API redirect targets get maxlag too — a
-                        // hop landing on api.php must not lose injection.
-                        let injected = maxlag::inject(next.as_str(), self.cfg.maxlag);
-                        current = Url::parse(&injected).map_err(|e| {
-                            Fail::Fatal(format!("redirect target unparseable: {e}"))
-                        })?;
-                        continue;
-                    }
-                    None => {
-                        // A 3xx without a parseable Location is not
-                        // actionable — surface it as a failure.
-                        let (_, body) = Self::body_of(resp, self.options.max_body_bytes)?;
-                        return Ok(self.finalize(Final {
-                            status,
-                            body,
-                            failure: true,
-                            hops: Vec::new(),
-                            robots: None,
-                        }));
-                    }
+            match self.manual_redirect(status, &resp_headers, &current, &mut hops)? {
+                Redirect::Follow(next) => {
+                    current = next;
+                    continue;
                 }
+                Redirect::DeadEnd => {
+                    // A 3xx without a parseable Location is not
+                    // actionable — surface it as a failure.
+                    let (_, body) = Self::body_of(resp, self.options.max_body_bytes)?;
+                    return Ok(self.done(status, body, true));
+                }
+                Redirect::None => {}
             }
+
+            // Every remaining path is terminal or backs off, and each
+            // reads (and accounts) the body exactly once.
+            let (hdrs, body) = Self::body_of(resp, self.options.max_body_bytes)?;
 
             // 429/503 with Retry-After backoff.
             if status == 429 || status == 503 {
-                let host = current.host_str().unwrap_or_default().to_string();
-                if cooldown_triggered(status, host_class(&host)) {
-                    // Other-services 5xx: never retried; cooldown recorded.
-                    let (_, body) = Self::body_of(resp, self.options.max_body_bytes)?;
-                    let until = pacing::record_cooldown(&self.state_dir, &host);
-                    eprintln!(
-                        "wm-fetch: HTTP 503 from {host}; Robot policy requires a ≥15-minute pause; retry after {}",
-                        fmt_hhmm(until)
-                    );
-                    return Ok(self.finalize(Final {
-                        status,
-                        body,
-                        failure: true,
-                        hops: Vec::new(),
-                        robots: None,
-                    }));
+                if let Some(final_resp) =
+                    self.handle_rate_limited(status, &current, attempt, attempts, &hdrs, body)?
+                {
+                    return Ok(final_resp);
                 }
-                let (hdrs, body) = Self::body_of(resp, self.options.max_body_bytes)?;
-                if attempt >= attempts {
-                    eprintln!("wm-fetch: giving up after {attempt} attempts (HTTP {status})");
-                    return Ok(self.finalize(Final {
-                        status,
-                        body,
-                        failure: true,
-                        hops: Vec::new(),
-                        robots: None,
-                    }));
-                }
-                let wait = Self::retry_after_secs(&hdrs, attempt);
-                self.budget_check(Duration::from_secs_f64(wait), "retry backoff")?;
-                eprintln!(
-                    "wm-fetch: HTTP {status}, backing off {wait:.0}s (attempt {attempt}/{attempts})"
-                );
-                std::thread::sleep(Duration::from_secs_f64(wait));
                 attempt += 1;
                 continue;
             }
@@ -856,68 +818,133 @@ impl Session {
             // 429/503 retry above), and the 15-minute cooldown is armed.
             if cooldown_triggered(status, host_class(current.host_str().unwrap_or_default())) {
                 let host = current.host_str().unwrap_or_default().to_string();
-                let (_, body) = Self::body_of(resp, self.options.max_body_bytes)?;
                 let until = pacing::record_cooldown(&self.state_dir, &host);
                 eprintln!(
                     "wm-fetch: HTTP {status} from {host}; Robot policy requires a ≥15-minute pause; retry after {}",
                     fmt_hhmm(until)
                 );
-                return Ok(self.finalize(Final {
-                    status,
-                    body,
-                    failure: true,
-                    hops: Vec::new(),
-                    robots: None,
-                }));
+                return Ok(self.done(status, body, true));
             }
 
             // Action API maxlag: the lag error arrives as HTTP 200 JSON.
             if status == 200 && surface(&current) == Surface::ActionApi {
-                let (hdrs, body) = Self::body_of(resp, self.options.max_body_bytes)?;
-                if let Some(ml) = maxlag::sniff_error(&body) {
-                    if let Some(lag) = hdrs.get("x-database-lag").and_then(|v| v.to_str().ok()) {
-                        eprintln!("wm-fetch: X-Database-Lag: {lag}");
-                    }
-                    if attempt >= attempts {
-                        eprintln!(
-                            "wm-fetch: giving up after {attempt} attempts (maxlag error persists)"
-                        );
-                        return Ok(self.finalize(Final {
-                            status,
-                            body,
-                            failure: true,
-                            hops: Vec::new(),
-                            robots: None,
-                        }));
-                    }
-                    let wait = Self::retry_after_secs(&hdrs, attempt).max(5.0);
-                    self.budget_check(Duration::from_secs_f64(wait), "maxlag backoff")?;
-                    eprintln!(
-                        "wm-fetch: maxlag error ({}), waiting {wait:.0}s (attempt {attempt}/{attempts})",
-                        ml.info.as_deref().unwrap_or("replica lag")
-                    );
-                    std::thread::sleep(Duration::from_secs_f64(wait));
-                    attempt += 1;
-                    continue;
+                if let Some(final_resp) = self.handle_maxlag(attempt, attempts, &hdrs, body)? {
+                    return Ok(final_resp);
                 }
-                return Ok(self.finalize(Final {
-                    status,
-                    body,
-                    failure: false,
-                    hops: Vec::new(),
-                    robots: None,
-                }));
+                attempt += 1;
+                continue;
             }
 
-            let (_, body) = Self::body_of(resp, self.options.max_body_bytes)?;
-            return Ok(self.finalize(Final {
-                status,
-                body,
-                failure: false,
-                hops: Vec::new(),
-                robots: None,
-            }));
+            return Ok(self.done(status, body, false));
         }
+    }
+
+    /// Classify one response for manual redirect following. `hops` is the
+    /// redirect budget for this fetch.
+    fn manual_redirect(
+        &self,
+        status: u16,
+        headers: &reqwest::header::HeaderMap,
+        current: &Url,
+        hops: &mut usize,
+    ) -> Result<Redirect, Fail> {
+        if !(300..400).contains(&status) {
+            return Ok(Redirect::None);
+        }
+        let loc = headers
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let Some(next) = loc.and_then(|l| current.join(&l).ok()) else {
+            return Ok(Redirect::DeadEnd);
+        };
+        *hops += 1;
+        if *hops > self.cfg.max_redirs {
+            return Err(Fail::Fatal(format!(
+                "too many redirects (limit {})",
+                self.cfg.max_redirs
+            )));
+        }
+        // Action API redirect targets get maxlag too — a hop landing on
+        // api.php must not lose injection.
+        let injected = maxlag::inject(next.as_str(), self.cfg.maxlag);
+        let target = Url::parse(&injected)
+            .map_err(|e| Fail::Fatal(format!("redirect target unparseable: {e}")))?;
+        Ok(Redirect::Follow(target))
+    }
+
+    /// 429/503 handling: the other-services cooldown exit, give-up after
+    /// exhausted retries, or the Retry-After backoff sleep. `Ok(None)`
+    /// means the backoff elapsed and the caller should retry.
+    fn handle_rate_limited(
+        &mut self,
+        status: u16,
+        current: &Url,
+        attempt: usize,
+        attempts: usize,
+        hdrs: &reqwest::header::HeaderMap,
+        body: Vec<u8>,
+    ) -> Result<Option<Final>, Fail> {
+        let host = current.host_str().unwrap_or_default().to_string();
+        if cooldown_triggered(status, host_class(&host)) {
+            // Other-services 5xx: never retried; cooldown recorded.
+            let until = pacing::record_cooldown(&self.state_dir, &host);
+            eprintln!(
+                "wm-fetch: HTTP 503 from {host}; Robot policy requires a ≥15-minute pause; retry after {}",
+                fmt_hhmm(until)
+            );
+            return Ok(Some(self.done(status, body, true)));
+        }
+        if attempt >= attempts {
+            eprintln!("wm-fetch: giving up after {attempt} attempts (HTTP {status})");
+            return Ok(Some(self.done(status, body, true)));
+        }
+        let wait = Self::retry_after_secs(hdrs, attempt);
+        self.budget_check(Duration::from_secs_f64(wait), "retry backoff")?;
+        eprintln!("wm-fetch: HTTP {status}, backing off {wait:.0}s (attempt {attempt}/{attempts})");
+        std::thread::sleep(Duration::from_secs_f64(wait));
+        Ok(None)
+    }
+
+    /// Action API maxlag handling for an HTTP-200 API response.
+    /// `Ok(None)` means the backoff elapsed and the caller should retry;
+    /// a 200 API body without a lag error is a clean success.
+    fn handle_maxlag(
+        &mut self,
+        attempt: usize,
+        attempts: usize,
+        hdrs: &reqwest::header::HeaderMap,
+        body: Vec<u8>,
+    ) -> Result<Option<Final>, Fail> {
+        let Some(ml) = maxlag::sniff_error(&body) else {
+            return Ok(Some(self.done(200, body, false)));
+        };
+        if let Some(lag) = hdrs.get("x-database-lag").and_then(|v| v.to_str().ok()) {
+            eprintln!("wm-fetch: X-Database-Lag: {lag}");
+        }
+        if attempt >= attempts {
+            eprintln!("wm-fetch: giving up after {attempt} attempts (maxlag error persists)");
+            return Ok(Some(self.done(200, body, true)));
+        }
+        let wait = Self::retry_after_secs(hdrs, attempt).max(5.0);
+        self.budget_check(Duration::from_secs_f64(wait), "maxlag backoff")?;
+        eprintln!(
+            "wm-fetch: maxlag error ({}), waiting {wait:.0}s (attempt {attempt}/{attempts})",
+            ml.info.as_deref().unwrap_or("replica lag")
+        );
+        std::thread::sleep(Duration::from_secs_f64(wait));
+        Ok(None)
+    }
+
+    /// A terminal [`Final`] for this fetch (hops and robots report attached).
+    fn done(&mut self, status: u16, body: Vec<u8>, failure: bool) -> Final {
+        self.finalize(Final {
+            status,
+            body,
+            failure,
+            hops: Vec::new(),
+            robots: None,
+        })
     }
 
     /// Attach the accumulated hops and robots report to a Final.
