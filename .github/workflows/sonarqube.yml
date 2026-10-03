@@ -1,0 +1,29 @@
+name: SonarCloud
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  sonar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Shallow clones break new-code detection on SonarCloud.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate Clippy report
+        # Sonar's Rust analyzer imports Clippy output as external issues;
+        # it does not run Clippy itself.
+        run: cargo clippy --all-targets --message-format=json > clippy-report.json
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

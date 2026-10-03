@@ -10,6 +10,18 @@ cargo test --release -- --ignored           # live tests against real Wikimedia 
 cargo fmt && cargo clippy --all-targets -- -D warnings   # CI enforces both
 ```
 
+## SonarQube gate
+
+Onboarded to SonarCloud (org `tieguy`, project key `tieguy_wm-fetch`). Marker
+files: `.sonar-config.json` (binds the `sonar` CLI checkout) and
+`sonar-project.properties` (scanner config). CI:
+`.github/workflows/sonarqube.yml` generates a Clippy JSON report and runs the
+SonarScanner on every push and PR; it needs the `SONAR_TOKEN` repo secret.
+
+Before committing code changes: `sonar analyze secrets` over changed files.
+After push, read `sonar list issues -p tieguy_wm-fetch --new-code --format toon`
+before follow-up work counts as done. BLOCKER/HIGH findings are must-fix.
+
 ## Ground rules
 
 - **Compliance is non-negotiable.** Do not add configuration that can
